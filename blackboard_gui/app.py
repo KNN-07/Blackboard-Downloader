@@ -55,6 +55,28 @@ else:
     FONT, FONT_MONO = "DejaVu Sans", "DejaVu Sans Mono"
 
 
+def resource_path(*parts: str) -> Path:
+    """Resolve bundled assets in both source and PyInstaller builds."""
+    bundle_root = Path(
+        getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent)
+    )
+    return bundle_root.joinpath(*parts)
+
+
+def configure_process_identity() -> None:
+    """Give Windows a stable taskbar identity before Tk creates a window."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(  # type: ignore[attr-defined]
+            "KNN-07.BlackboardDownloader"
+        )
+    except (AttributeError, OSError):
+        pass
+
+
 class BlackboardApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -63,6 +85,9 @@ class BlackboardApp(tk.Tk):
         self.minsize(790, 660)
         self.configure(bg=COLORS["bg"])
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.window_icon_image = None
+        self.header_logo_image = None
+        self._configure_window_icon()
 
         self.events: queue.Queue[tuple] = queue.Queue()
         self.cancel_event = threading.Event()
@@ -116,6 +141,23 @@ class BlackboardApp(tk.Tk):
         self.bind("<Escape>", lambda _event: self._cancel_download() if self.downloading else None)
         self.after(100, self._drain_events)
         self.after(300, self._audit_environment)
+
+    def _configure_window_icon(self) -> None:
+        try:
+            self.window_icon_image = tk.PhotoImage(
+                file=str(resource_path("assets", "app_icon.png"))
+            )
+            self.iconphoto(True, self.window_icon_image)
+        except tk.TclError:
+            self.window_icon_image = None
+
+        if sys.platform == "win32":
+            try:
+                self.iconbitmap(
+                    default=str(resource_path("assets", "app_icon.ico"))
+                )
+            except tk.TclError:
+                pass
 
     def _configure_styles(self) -> None:
         style = ttk.Style(self)
@@ -246,15 +288,36 @@ class BlackboardApp(tk.Tk):
         header = ttk.Frame(outer)
         header.grid(row=0, column=0, sticky="ew", pady=(0, 18))
         header.columnconfigure(1, weight=1)
-        self.logo_label = tk.Label(
-            header,
-            text="↓",
-            font=(FONT, 18, "bold"),
-            background=COLORS["primary"],
-            foreground="white",
-            width=2,
-            height=1,
-        )
+        try:
+            from PIL import Image, ImageTk
+
+            with Image.open(resource_path("assets", "app_icon.png")) as source:
+                header_logo = source.convert("RGBA")
+                header_logo.thumbnail((44, 44), Image.Resampling.LANCZOS)
+            self.header_logo_image = ImageTk.PhotoImage(header_logo)
+        except (ImportError, OSError, tk.TclError):
+            self.header_logo_image = None
+
+        if self.header_logo_image:
+            self.logo_label = tk.Label(
+                header,
+                image=self.header_logo_image,
+                background=COLORS["bg"],
+                width=44,
+                height=44,
+                borderwidth=0,
+                highlightthickness=0,
+            )
+        else:
+            self.logo_label = tk.Label(
+                header,
+                text="↓",
+                font=(FONT, 18, "bold"),
+                background=COLORS["primary"],
+                foreground="white",
+                width=2,
+                height=1,
+            )
         self.logo_label.grid(row=0, column=0, rowspan=2, sticky="w", padx=(0, 12))
         ttk.Label(header, text="Blackboard Downloader", style="Title.TLabel").grid(row=0, column=1, sticky="w")
         self.forget_button = ttk.Button(
@@ -1518,4 +1581,5 @@ class BlackboardApp(tk.Tk):
 
 
 def main() -> None:
+    configure_process_identity()
     BlackboardApp().mainloop()

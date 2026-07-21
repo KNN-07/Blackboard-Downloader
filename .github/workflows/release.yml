@@ -30,15 +30,19 @@ jobs:
           - os: windows-latest
             label: Windows x64
             artifact: windows-x64
+            icon: ico
           - os: macos-15
             label: macOS Apple Silicon
             artifact: macos-arm64
+            icon: icns
           - os: macos-15-intel
             label: macOS Intel
             artifact: macos-x64
+            icon: icns
           - os: ubuntu-22.04
             label: Linux x64
             artifact: linux-x64
+            icon: png
 
     steps:
       - name: Check out repository
@@ -79,6 +83,8 @@ jobs:
           --onefile
           --windowed
           --name "Blackboard Downloader"
+          --icon "assets/app_icon.${{ matrix.icon }}"
+          --add-data "assets:assets"
           --collect-all keyring
           --collect-all selenium
           main.py
@@ -111,9 +117,10 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          mkdir -p release package/DEBIAN package/usr/bin package/usr/share/applications
+          mkdir -p release package/DEBIAN package/usr/bin package/usr/share/applications package/usr/share/icons/hicolor/512x512/apps
           install -m 755 "dist/Blackboard Downloader" package/usr/bin/blackboard-downloader
           install -m 644 installer/linux/blackboard-downloader.desktop package/usr/share/applications/
+          install -m 644 assets/app_icon.png package/usr/share/icons/hicolor/512x512/apps/blackboard-downloader.png
           sed "s/@VERSION@/${APP_VERSION}/g" installer/linux/control.in > package/DEBIAN/control
           dpkg-deb --build --root-owner-group package "release/blackboard-downloader_${APP_VERSION}_amd64.deb"
           cp "dist/Blackboard Downloader" "release/blackboard-downloader"

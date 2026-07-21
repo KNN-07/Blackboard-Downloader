@@ -2,6 +2,7 @@
 #define MyAppPublisher "KNN-07"
 #define MyAppURL "https://github.com/KNN-07/Blackboard-Downloader"
 #define MyAppExeName "Blackboard Downloader.exe"
+#define MyAppUserModelId "KNN-07.BlackboardDownloader"
 #define MyAppVersion GetEnv("APP_VERSION")
 
 #if MyAppVersion == ""
@@ -22,6 +23,7 @@ DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 OutputDir=..\..\release
 OutputBaseFilename=Blackboard-Downloader-{#MyAppVersion}-Windows-x64-Setup
+SetupIconFile=..\..\assets\app_icon.ico
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
@@ -41,8 +43,8 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 Source: "..\..\dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"; AppUserModelID: "{#MyAppUserModelId}"
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"; AppUserModelID: "{#MyAppUserModelId}"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent

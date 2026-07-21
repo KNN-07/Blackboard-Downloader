@@ -149,6 +149,7 @@ blackboard_gui/
 ├── secure_store.py     # Encrypted cross-platform session persistence
 └── branding_cache.py   # Institution name and logo cache
 tests/                  # Unit and regression tests
+assets/                 # Shared app icons for the UI and native packages
 main.py                 # Application entry point
 requirements.txt        # Runtime dependencies
 ```

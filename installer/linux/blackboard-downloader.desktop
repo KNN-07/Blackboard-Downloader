@@ -3,6 +3,6 @@ Type=Application
 Name=Blackboard Downloader
 Comment=Save an offline copy of Blackboard course files
 Exec=/usr/bin/blackboard-downloader
-Icon=applications-education
+Icon=blackboard-downloader
 Terminal=false
 Categories=Education;Network;
