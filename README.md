@@ -38,6 +38,16 @@ It is designed for Blackboard Ultra installations that expose Blackboard's publi
 - A Blackboard account with access to the desired courses
 - Linux only: a working Secret Service provider for secure session storage
 
+## Download installers
+
+Prebuilt packages are published on the [GitHub Releases page](https://github.com/KNN-07/Blackboard-Downloader/releases):
+
+- Windows x64 setup installer and portable `.exe`
+- macOS Apple Silicon and Intel `.dmg` images
+- Linux x64 Debian package and portable `.tar.gz`
+
+The packages are currently unsigned. Windows SmartScreen and macOS Gatekeeper may therefore ask for confirmation before the first launch. Review the source and release workflow before bypassing an operating-system warning.
+
 ## Quick start
 
 Clone the repository and enter the project directory:
@@ -152,7 +162,32 @@ python -m unittest discover -s tests -v
 
 The regression suite covers session storage, dependency auditing, Blackboard response handling, content-tree filtering, lazy and parallel indexing, parallel download progress, stale URLs, duplicate paths, and legacy path migration.
 
-## Building a desktop executable
+## Automated builds and releases
+
+Every push and pull request to `main` runs the test suite on Windows, macOS, and Linux with Python 3.10 and 3.12.
+
+The **Build installers** workflow supports two release paths:
+
+- Run it manually from the GitHub Actions page to produce downloadable workflow artifacts retained for 14 days.
+- Push a version tag to build every platform and publish the results as a GitHub Release:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Version tags must begin with `v` and use a value such as `v0.1.0` or `v0.1.0-beta.1`.
+
+The release matrix produces:
+
+```text
+Windows x64       Setup.exe + portable.exe
+macOS arm64       DMG
+macOS x86_64      DMG
+Linux x86_64      DEB + portable tar.gz
+```
+
+## Building locally
 
 Install PyInstaller and build on the operating system you want to target:
 

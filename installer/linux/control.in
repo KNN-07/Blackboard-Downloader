@@ -1,0 +1,10 @@
+Package: blackboard-downloader
+Version: @VERSION@
+Section: education
+Priority: optional
+Architecture: amd64
+Maintainer: Nguyen Khac Trung Kien <trungkiennguyenkhac007@gmail.com>
+Depends: libsecret-1-0
+Description: Selective Blackboard Learn course file downloader
+ Blackboard Downloader signs in through the institution's browser flow and
+ saves an organized offline copy of selected Blackboard course content.

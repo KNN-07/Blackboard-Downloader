@@ -1,0 +1,152 @@
+name: Build installers
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version embedded in installer filenames
+        required: true
+        default: 0.1.0-dev
+        type: string
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: Windows x64
+            artifact: windows-x64
+          - os: macos-15
+            label: macOS Apple Silicon
+            artifact: macos-arm64
+          - os: macos-15-intel
+            label: macOS Intel
+            artifact: macos-x64
+          - os: ubuntu-22.04
+            label: Linux x64
+            artifact: linux-x64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Resolve version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="${{ inputs.version }}"
+          fi
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([._-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid version: $version" >&2
+            exit 1
+          fi
+          echo "APP_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Install build dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt pyinstaller
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Build application
+        shell: bash
+        run: >-
+          pyinstaller
+          --noconfirm
+          --clean
+          --onefile
+          --windowed
+          --name "Blackboard Downloader"
+          --collect-all keyring
+          --collect-all selenium
+          main.py
+
+      - name: Package Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release -Force | Out-Null
+          Copy-Item 'dist\Blackboard Downloader.exe' "release\Blackboard-Downloader-$env:APP_VERSION-Windows-x64.exe"
+          choco install innosetup --no-progress --yes
+          & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' 'installer\windows\BlackboardDownloader.iss'
+
+      - name: Package macOS disk image
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p release dmg-root
+          cp -R "dist/Blackboard Downloader.app" dmg-root/
+          ln -s /Applications dmg-root/Applications
+          arch="$(uname -m)"
+          hdiutil create \
+            -volname "Blackboard Downloader" \
+            -srcfolder dmg-root \
+            -ov \
+            -format UDZO \
+            "release/Blackboard-Downloader-${APP_VERSION}-macOS-${arch}.dmg"
+
+      - name: Package Linux installers
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p release package/DEBIAN package/usr/bin package/usr/share/applications
+          install -m 755 "dist/Blackboard Downloader" package/usr/bin/blackboard-downloader
+          install -m 644 installer/linux/blackboard-downloader.desktop package/usr/share/applications/
+          sed "s/@VERSION@/${APP_VERSION}/g" installer/linux/control.in > package/DEBIAN/control
+          dpkg-deb --build --root-owner-group package "release/blackboard-downloader_${APP_VERSION}_amd64.deb"
+          cp "dist/Blackboard Downloader" "release/blackboard-downloader"
+          tar -czf "release/Blackboard-Downloader-${APP_VERSION}-Linux-x64.tar.gz" -C release blackboard-downloader
+          rm release/blackboard-downloader
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v7
+        with:
+          name: Blackboard-Downloader-${{ matrix.artifact }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download installers
+        uses: actions/download-artifact@v8
+        with:
+          pattern: Blackboard-Downloader-*
+          path: release
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: release/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
