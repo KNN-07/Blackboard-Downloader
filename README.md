@@ -4,6 +4,7 @@ A small cross-platform desktop app for saving an organized offline copy of your 
 
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-2f6545)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ![Blackboard Downloader desktop interface](docs/blackboard-downloader-demo.png)
 
@@ -227,3 +228,7 @@ Issues and focused pull requests are welcome. Please include the operating syste
 ## Disclaimer
 
 This is an unofficial community project and is not affiliated with or endorsed by Anthology Inc., Blackboard, Nanyang Technological University, or any other institution. Use it only with accounts and course materials you are authorized to access, and follow your institution's policies and applicable copyright rules.
+
+## License
+
+Blackboard Downloader is released under the [MIT License](LICENSE).
