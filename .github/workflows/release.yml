@@ -6,7 +6,7 @@ on:
       version:
         description: Version embedded in the application and installer filenames
         required: true
-        default: 0.2.0
+        default: 0.2.1
         type: string
   push:
     tags:

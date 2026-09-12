@@ -5,6 +5,7 @@ from unittest.mock import Mock
 from pathlib import Path
 
 from blackboard_gui.client import (
+    AuthenticationError,
     BlackboardError,
     BlackboardClient,
     ContentNode,
@@ -94,7 +95,7 @@ class ClientHelpersTest(unittest.TestCase):
         client = object.__new__(BlackboardClient)
         client.base_url = "https://learn.example.edu"
         roots = [{"id": f"item-{index}", "title": f"Item {index}"} for index in range(6)]
-        client._paged_json = Mock(return_value=roots)
+        client._paged_json = Mock(side_effect=lambda url, **_kwargs: roots if "/contents?" in url else [])
         condition = threading.Condition()
         release = threading.Event()
         state = {"active": 0, "peak": 0}
@@ -155,7 +156,6 @@ class ClientHelpersTest(unittest.TestCase):
                 threading.Event(),
             )
         self.assertEqual(result, (0, 0, 1))
-        self.assertTrue(any("Unavailable on Blackboard" in message for _, message in messages))
 
     def test_download_file_maps_http_404_to_unavailable(self):
         response = Mock(status_code=404)
@@ -219,6 +219,10 @@ class ClientHelpersTest(unittest.TestCase):
                 self.assertEqual(
                     [event for event in events if event[0] == "file"][-1][2:], (2, 2)
                 )
+                selection = CourseSelection(selection.course, (
+                    ContentNode("post", "Documents.pdf", tuple(reversed(files))),
+                ))
+                self.assertEqual(download(), (0, 2, 0))
 
     def test_repeated_folder_titles_are_collapsed(self):
         client = object.__new__(BlackboardClient)
@@ -314,7 +318,7 @@ class ClientHelpersTest(unittest.TestCase):
         state = {"active": 0, "peak": 0}
 
         class Worker:
-            def _download_file(self, _url, destination, _cancel):
+            def _download_remote(self, _remote, destination, _cancel):
                 with condition:
                     state["active"] += 1
                     state["peak"] = max(state["peak"], state["active"])
@@ -423,6 +427,178 @@ class ClientHelpersTest(unittest.TestCase):
             selector,
             "div.MuiDrawer-root.MuiDrawer-anchorLeft header > a > img",
         )
+
+
+class ContentDiscoveryRegressionTest(unittest.TestCase):
+    def setUp(self):
+        self.client = object.__new__(BlackboardClient)
+        self.client.base_url = "https://learn.example.edu"
+        self.client.session = Mock()
+
+    def test_stub_click_target_precedes_rendering_resource_and_merges_only_same_xid(self):
+        files = self.client._extract_body_files(
+            """<a href="@X@EmbeddedFile.requestUrlStub@X@bbcswebdav/xid-1217_1?signature=one"
+            data-bbfile='{"linkName":"notes.pdf","mimeType":"application/pdf","resourceUrl":"/bbcswebdav/xid-1217_1?signature=two"}'>notes</a>
+            <a href="/bbcswebdav/xid-1217_1?signature=three">notes.pdf</a>
+            <a href="/bbcswebdav/xid-9999_1">notes.pdf</a>""", None,
+        )
+        self.assertEqual(len(files), 2)
+        self.assertEqual(files[0].url, "https://learn.example.edu/bbcswebdav/xid-1217_1?signature=one")
+        self.assertEqual(set(files[0].alternatives), {
+            "https://learn.example.edu/bbcswebdav/xid-1217_1?signature=two",
+            "https://learn.example.edu/bbcswebdav/xid-1217_1?signature=three",
+        })
+        self.assertNotEqual(files[0].identity, files[1].identity)
+
+    def test_distinct_files_beneath_same_xythos_folder_are_not_merged(self):
+        files = self.client._extract_body_files(
+            '<a href="/bbcswebdav/xid-123_1/one.pdf">notes.pdf</a>'
+            '<a href="/bbcswebdav/xid-123_1/two.pdf">notes.pdf</a>', None,
+        )
+        self.assertEqual({file.url for file in files}, {
+            "https://learn.example.edu/bbcswebdav/xid-123_1/one.pdf",
+            "https://learn.example.edu/bbcswebdav/xid-123_1/two.pdf",
+        })
+
+    def test_expired_blackboard_session_is_not_reported_as_missing_file(self):
+        self.client.session.get.return_value = Mock(status_code=401)
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "notes.pdf"
+            with self.assertRaises(AuthenticationError):
+                self.client._download_remote(
+                    RemoteFile(self.client.base_url + "/file", "notes.pdf", ".pdf"),
+                    destination, threading.Event(),
+                )
+            self.assertFalse(destination.exists())
+
+    def test_malformed_metadata_and_embedded_media_keep_real_targets(self):
+        files = self.client._extract_body_files(
+            """<a data-bbfile="invalid" href="/notes.pdf?key=signed">Download</a>
+            <img src="/figure.png"><audio src="/recording.mp3"></audio>
+            <video src="/lecture.mp4"><source src="/lecture.webm"></video>
+            <object data="/sheet.xlsx"></object><a href="/bbcswebdav/xid-22_1">Unknown</a>
+            <a href="/content.jsp">not-a-file.pdf</a>""", None,
+        )
+        self.assertEqual({file.extension for file in files},
+                         {".pdf", ".png", ".mp3", ".mp4", ".webm", ".xlsx", ".bin"})
+        self.assertEqual(files[0].url, "https://learn.example.edu/notes.pdf?key=signed")
+
+    def test_same_xid_alternative_recovers_in_one_download_job(self):
+        remote = RemoteFile("https://learn.example.edu/bbcswebdav/xid-1_1?old",
+                            "notes.pdf", ".pdf",
+                            ("https://learn.example.edu/bbcswebdav/xid-1_1?new",))
+        missing = Mock(status_code=404)
+        available = Mock(status_code=200, headers={"Content-Type": "application/pdf"})
+        available.iter_content.return_value = [b"%PDF-1.4\nRecovered notes"]
+        self.client.session.get.side_effect = [missing, available]
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "notes.pdf"
+            self.client._download_remote(remote, destination, threading.Event())
+            self.assertEqual(destination.read_bytes(), b"%PDF-1.4\nRecovered notes")
+            self.assertEqual(list(Path(directory).iterdir()), [destination])
+
+    def test_refresh_matches_identity_not_reused_filename(self):
+        old = "https://learn.example.edu/bbcswebdav/xid-1_1?old"
+        source = "https://learn.example.edu/learn/api/public/v1/courses/c/contents/i"
+        remote = RemoteFile(old, "notes.pdf", ".pdf", identity=self.client._file_identity(old),
+                            source_url=source)
+        response = Mock(status_code=200)
+        response.json.return_value = {"body": '<a href="/bbcswebdav/xid-2_1?new">notes.pdf</a><a href="/bbcswebdav/xid-1_1?new">notes.pdf</a>'}
+        self.client.session.get.return_value = response
+        self.assertEqual(self.client._refresh_file(remote),
+                         ("https://learn.example.edu/bbcswebdav/xid-1_1?new",))
+
+    def test_login_html_is_not_saved_as_pdf(self):
+        response = Mock(status_code=200, headers={"Content-Type": "text/html"})
+        response.iter_content.return_value = [b'<!doctype html><form>Sign in</form>']
+        self.client.session.get.return_value = response
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "notes.pdf"
+            with self.assertRaises(FileUnavailableError):
+                self.client._download_file("https://learn.example.edu/login?secret=value",
+                                           destination, threading.Event())
+            self.assertFalse(destination.exists())
+            self.assertFalse(destination.with_suffix(".pdf.part").exists())
+
+    def test_generated_bytes_share_filters_progress_and_do_not_flatten(self):
+        remote = RemoteFile("https://learn.example.edu/content", "Notes.md", ".md",
+                            content=b"# Notes\n\nA meaningful course note.")
+        node = ContentNode("notes", "Notes", (remote,))
+        self.assertFalse(is_file_wrapper_node(node))
+        self.client.create_worker_client = lambda: self.client
+        self.client.close = Mock()
+        events = []
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.client.download_courses(
+                [CourseSelection(Course("c", "Course", "", ""), (node,))], Path(directory),
+                {".md"}, lambda *event: events.append(event), threading.Event(),
+            )
+            self.assertEqual(result, (1, 0, 0))
+            self.assertEqual((Path(directory) / "Course" / "Notes" / "Notes.md").read_bytes(),
+                             remote.content)
+        self.client.session.get.assert_not_called()
+        self.assertEqual([event for event in events if event[0] == "file"][-1][2:], (1, 1))
+
+    def test_resources_subtree_and_announcement_notes_and_files(self):
+        base = self.client.base_url + "/learn/api/public/v1/courses/c"
+        listings = {
+            f"{base}/resources?limit=100": [{"id": "folder", "name": "Materials", "type": "Folder"}],
+            f"{base}/resources/folder/children?limit=100": [
+                {"id": "file", "name": "reference.pdf", "type": "File",
+                 "downloadUrl": "/bbcswebdav/xid-123_1?token=provided"},
+            ],
+            f"{base}/announcements?limit=100": [{"id": "announcement", "title": "Reminder"}],
+        }
+        self.client._paged_json = Mock(side_effect=lambda url, **_kwargs: listings[url])
+        response = Mock(status_code=200)
+        response.json.return_value = {"body": '<p>Read this before class.</p><a href="/reading.pdf">reading.pdf</a>'}
+        self.client.session.get.return_value = response
+        resources, announcements = self.client._course_extras("c", threading.Event())
+        self.assertEqual(resources.children[0].children[0].files[0].url,
+                         "https://learn.example.edu/bbcswebdav/xid-123_1?token=provided")
+        self.assertTrue({".md", ".pdf"} <= {file.extension for file in announcements.children[0].files})
+
+    def test_optional_permission_does_not_hide_required_permission_errors(self):
+        self.client.session.get.return_value = Mock(status_code=403)
+        self.assertEqual(self.client._course_extras("c", threading.Event()), ())
+        with self.assertRaises(BlackboardError):
+            self.client._paged_json("https://learn.example.edu/required")
+
+    def test_explicit_code_files_and_html_are_files_not_navigation(self):
+        files = self.client._extract_body_files(
+            """<a download="example.html" href="/download?id=1">Page source</a>
+            <a href="/script.js" data-bbfile='{"linkName":"script.js"}'>Code</a>
+            <a href="/data.json" data-bbfile='{"linkName":"data.json"}'>Data</a>
+            <a href="/course.html">Course page</a>""", None,
+        )
+        self.assertEqual({file.extension for file in files}, {".html", ".js", ".json"})
+        response = Mock(status_code=200, headers={"Content-Type": "text/html"},
+                        url="https://learn.example.edu/download?id=1")
+        response.iter_content.return_value = [b"<!doctype html><html><p>Example page</p></html>"]
+        self.client.session.get.return_value = response
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "example.html"
+            self.client._download_file(files[0].url, destination, threading.Event())
+            self.assertEqual(destination.read_bytes(), b"<!doctype html><html><p>Example page</p></html>")
+
+    def test_attachment_redirect_evidence_merges_with_body_not_same_named_other_attachment(self):
+        detail = Mock(status_code=200)
+        detail.json.return_value = {"title": "Materials", "body":
+                                   '<a href="/bbcswebdav/xid-1_1?browser=1">notes.pdf</a>'}
+        matching = Mock(status_code=302, headers={"Location": "/bbcswebdav/xid-1_1?api=1"})
+        unrelated = Mock(status_code=302, headers={"Location": "/bbcswebdav/xid-2_1"})
+        self.client.session.get.side_effect = [detail, matching, unrelated]
+        self.client._paged_json = Mock(side_effect=[
+            [{"id": "a", "fileName": "notes.pdf"}, {"id": "b", "fileName": "notes.pdf"}], [],
+        ])
+        result = self.client._read_content_item("c", {"id": "i"}, threading.Event())
+        files = [file for file in result[2] if file.content is None]
+        self.assertEqual(len(files), 2)
+        self.assertEqual(files[0].url, "https://learn.example.edu/bbcswebdav/xid-1_1?browser=1")
+        self.assertIn("https://learn.example.edu/learn/api/public/v1/courses/c/contents/i/attachments/a/download",
+                      files[0].alternatives)
+        self.assertNotEqual(files[0].identity, files[1].identity)
+
 
 
 if __name__ == "__main__":

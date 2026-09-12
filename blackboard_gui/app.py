@@ -490,7 +490,7 @@ class BlackboardApp(tk.Tk):
             download,
             3,
             "Download",
-            "File types are discovered from your selected course content.",
+            "Choose files, Markdown notes, and URL shortcuts from the selected content.",
         ).grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 10))
 
         fields = ttk.Frame(download)
@@ -832,6 +832,10 @@ class BlackboardApp(tk.Tk):
 
     @staticmethod
     def _extension_label(extension: str) -> str:
+        if extension == ".md":
+            return "Markdown"
+        if extension == ".url":
+            return "URL links"
         return extension.lstrip(".").upper() if extension else "NO EXT"
 
     def _show_course_message(self, message: str) -> None:
@@ -1116,7 +1120,7 @@ class BlackboardApp(tk.Tk):
         if not counts:
             self.file_types_empty = ttk.Label(
                 self.extension_container,
-                text="No files in the selected content",
+                text="No files, notes, or links in the selected content",
                 style="Muted.TLabel",
             )
             self.file_types_empty.grid(row=0, column=0, sticky="w")

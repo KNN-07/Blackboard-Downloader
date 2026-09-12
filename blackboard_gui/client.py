@@ -5,12 +5,13 @@ import hashlib
 import re
 import threading
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable
 from urllib.parse import unquote, urljoin, urlparse
 
 from .dependencies import install_command
+from .content_export import export_content, resolve_content_url
 
 ProgressCallback = Callable[[str, str, int, int], None]
 
@@ -24,7 +25,7 @@ class AuthenticationError(BlackboardError):
 
 
 class FileUnavailableError(BlackboardError):
-    """A catalogued file was removed or became unavailable before download."""
+    """A catalogued link could not be accessed; this does not imply deletion."""
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,10 @@ class RemoteFile:
     url: str
     filename: str
     extension: str = ""
+    alternatives: tuple[str, ...] = ()
+    identity: str = ""
+    source_url: str = ""
+    content: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -78,10 +83,21 @@ MIME_EXTENSIONS = {
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
     "application/zip": ".zip",
     "video/mp4": ".mp4",
+    "text/plain": ".txt",
+    "text/html": ".html",
+    "text/css": ".css",
+    "application/json": ".json",
+    "application/xml": ".xml",
+    "application/javascript": ".js",
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/svg+xml": ".svg",
+    "audio/mpeg": ".mp3",
+    "audio/ogg": ".ogg",
+    "video/webm": ".webm",
 }
 
-# Blackboard page links frequently end in server-side route extensions. They are
-# navigation targets, not course documents, and should never become download filters.
+# Exclude navigation/page assets only for heuristic body links, never explicit files.
 IGNORED_WEB_EXTENSIONS = {
     ".action",
     ".asp",
@@ -235,7 +251,7 @@ def filter_content_nodes(
 
 def is_file_wrapper_node(node: ContentNode) -> bool:
     """Identify Blackboard leaf nodes that merely wrap one downloadable file."""
-    if node.children or len(node.files) != 1:
+    if node.children or len(node.files) != 1 or node.files[0].content is not None:
         return False
     title = _clean_name(node.title, "Untitled content")
     if is_downloadable_extension(Path(title).suffix.lower()):
@@ -703,9 +719,96 @@ class BlackboardClient:
                 return None
             return ContentNode(item_id, title, files, children)
 
-        return tuple(
+        contents = tuple(
             node for item_id in root_ids if (node := build(item_id, frozenset())) is not None
         )
+        return contents + self._course_extras(course.id, cancel)
+
+    def _item_files(self, course_id: str, item: dict, source_url: str) -> list[RemoteFile]:
+        files = [
+            replace(remote, source_url=source_url)
+            for field in ("body", "description")
+            for remote in self._extract_body_files(item.get(field, ""), None)
+        ]
+        files.extend(
+            RemoteFile(export.url, export.filename, export.extension,
+                       identity=f"{source_url}#export:{index}", source_url=source_url,
+                       content=export.content)
+            for index, export in enumerate(export_content(self.base_url, course_id, item))
+        )
+        return self._merge_files(files)
+
+    def _course_extras(self, course_id: str, cancel: threading.Event) -> tuple[ContentNode, ...]:
+        base = f"{self.base_url}/learn/api/public/v1/courses/{course_id}"
+        visited: set[str] = set()
+
+        def resource_node(item: dict) -> ContentNode | None:
+            self._check_cancel(cancel)
+            resource_id = str(item.get("id") or "")
+            if not resource_id or resource_id in visited:
+                return None
+            visited.add(resource_id)
+            source = f"{base}/resources/{resource_id}"
+            if item.get("type") == "File" and not item.get("downloadUrl"):
+                detail = self._get(source, timeout=30)
+                try:
+                    if detail.status_code == 401:
+                        raise AuthenticationError("Your Blackboard session expired. Sign in again.")
+                    if detail.status_code == 200:
+                        item = {**item, **detail.json()}
+                finally:
+                    detail.close()
+            children = ()
+            if item.get("type") == "Folder":
+                children = tuple(
+                    node for child in self._paged_json(f"{source}/children?limit=100", missing_ok=True)
+                    if (node := resource_node(child)) is not None
+                )
+            files = []
+            url = resolve_content_url(item.get("downloadUrl", ""), self.base_url)
+            if item.get("type") == "File" and url:
+                filename = item.get("name") or "download"
+                extension = detected_extension(filename, item.get("mimeType", "")) or ".bin"
+                if extension:
+                    files.append(RemoteFile(url, filename, extension, identity=source, source_url=source))
+            if not files and not children:
+                return None
+            return ContentNode(f"resource:{resource_id}", item.get("name") or "Resource",
+                               tuple(files), children)
+
+        resources = tuple(
+            node for item in self._paged_json(f"{base}/resources?limit=100", missing_ok=True)
+            if (node := resource_node(item)) is not None
+        )
+        announcements = []
+        for item in self._paged_json(f"{base}/announcements?limit=100", missing_ok=True):
+            self._check_cancel(cancel)
+            item_id = str(item.get("id") or "")
+            if not item_id:
+                continue
+            source = f"{base}/announcements/{item_id}"
+            detail = self._get(source, timeout=30)
+            try:
+                if detail.status_code == 401:
+                    raise AuthenticationError("Your Blackboard session expired. Sign in again.")
+                if detail.status_code == 200:
+                    item = {**item, **detail.json()}
+            finally:
+                detail.close()
+            if not item.get("links"):
+                # Browser course page, not a fabricated announcement REST permalink.
+                item = {**item, "links": [{"rel": "alternate", "href":
+                        f"{self.base_url}/ultra/courses/{course_id}/announcements"}]}
+            files = self._item_files(course_id, item, source)
+            if files:
+                announcements.append(ContentNode(f"announcement:{item_id}",
+                                                 item.get("title") or "Announcement", tuple(files)))
+        extras = []
+        if resources:
+            extras.append(ContentNode("resources", "Course resources", children=resources))
+        if announcements:
+            extras.append(ContentNode("announcements", "Announcements", children=tuple(announcements)))
+        return tuple(extras)
 
     def _read_content_item(
         self, course_id: str, item: dict, cancel: threading.Event
@@ -721,13 +824,15 @@ class BlackboardClient:
         title = item.get("title") or "Untitled content"
         files: list[RemoteFile] = []
 
-        detail = self._get(item_url, timeout=30)
-        if detail.status_code in {401, 403}:
-            raise AuthenticationError("Your Blackboard session expired. Sign in again.")
-        if detail.status_code == 200:
-            detail_data = detail.json()
-            title = detail_data.get("title") or title
-            files.extend(self._extract_body_files(detail_data.get("body", ""), None))
+        detail = self._get(item_url, timeout=30, params={"includeInActivityTracking": "false"})
+        try:
+            if detail.status_code == 401:
+                raise AuthenticationError("Your Blackboard session expired. Sign in again.")
+            detail_data = {**item, **detail.json()} if detail.status_code == 200 else item
+        finally:
+            detail.close()
+        title = detail_data.get("title") or title
+        files.extend(self._item_files(course_id, detail_data, item_url))
 
         for attachment in self._paged_json(
             f"{item_url}/attachments?limit=100", missing_ok=True
@@ -736,21 +841,39 @@ class BlackboardClient:
             if not attachment_id:
                 continue
             filename = attachment.get("fileName") or "download"
-            extension = detected_extension(filename, attachment.get("mimeType", ""))
-            if not is_downloadable_extension(extension):
+            extension = detected_extension(filename, attachment.get("mimeType", "")) or ".bin"
+            if not extension:
                 continue
+            download_url = f"{item_url}/attachments/{attachment_id}/download"
+            identity = f"{item_url}/attachments/{attachment_id}"
+            alternatives = ()
+            # Only a returned redirect can connect an attachment ID to a BBML xid.
+            if any("/bbcswebdav/xid-" in remote.identity for remote in files):
+                redirect = self._get(download_url, stream=True, allow_redirects=False, timeout=30)
+                try:
+                    if redirect.status_code in {301, 302, 303, 307, 308}:
+                        target = resolve_content_url(redirect.headers.get("Location", ""), download_url)
+                        target_identity = self._file_identity(target) if target else ""
+                        if target_identity and any(remote.identity == target_identity for remote in files):
+                            identity = target_identity
+                            alternatives = (target,)
+                finally:
+                    redirect.close()
             files.append(
                 RemoteFile(
-                    url=f"{item_url}/attachments/{attachment_id}/download",
+                    url=download_url,
                     filename=filename,
                     extension=extension,
+                    alternatives=alternatives,
+                    identity=identity,
+                    source_url=item_url,
                 )
             )
 
         children = self._paged_json(
-            f"{item_url}/children?limit=100", missing_ok=True
+            f"{item_url}/children?limit=100&includeInActivityTracking=false", missing_ok=True
         )
-        return item_id, title, tuple(files), children
+        return item_id, title, tuple(self._merge_files(files)), children
 
     def _scan_content_node(
         self,
@@ -797,8 +920,8 @@ class BlackboardClient:
         unavailable = 0
         output_dir.mkdir(parents=True, exist_ok=True)
         jobs: dict[Path, RemoteFile] = {}
-        used_paths: set[str] = set()
-        seen_files: set[tuple[str, str]] = set()
+        candidates: dict[str, list[tuple[Path, RemoteFile]]] = {}
+        seen_files: dict[tuple[str, str], tuple[str, int]] = {}
 
         for selection in selections:
             self._check_cancel(cancel)
@@ -826,30 +949,44 @@ class BlackboardClient:
                     self._check_cancel(cancel)
                     if remote.extension not in extensions:
                         continue
-                    identity = (str(node_dir).casefold(), remote.url)
+                    identity = (str(node_dir).casefold(), remote.identity or remote.url)
                     if identity in seen_files:
+                        key, index = seen_files[identity]
+                        previous_path, previous = candidates[key][index]
+                        candidates[key][index] = (previous_path, self._merge_files((previous, remote))[0])
                         continue
-                    seen_files.add(identity)
                     filename = _clean_name(remote.filename, "download")
                     if not Path(filename).suffix:
                         filename += remote.extension
                     destination = bounded_child_path(node_dir, filename, directory=False)
-                    number = 2
-                    while str(destination).casefold() in used_paths:
-                        destination = bounded_child_path(
-                            node_dir,
-                            f"{Path(filename).stem} ({number}){Path(filename).suffix}",
-                            directory=False,
-                        )
-                        number += 1
-                    used_paths.add(str(destination).casefold())
-                    jobs[destination] = remote
+                    key = str(destination).casefold()
+                    group = candidates.setdefault(key, [])
+                    seen_files[identity] = (key, len(group))
+                    group.append((destination, remote))
 
                 for child in node.children:
                     collect_node(child, node_dir)
 
             for root in selection.contents:
                 collect_node(root, course_dir)
+
+        used_paths: set[str] = set()
+        for group in candidates.values():
+            for destination, remote in group:
+                if len(group) > 1:
+                    digest = hashlib.sha256((remote.identity or remote.url).encode()).hexdigest()[:12]
+                    destination = bounded_child_path(
+                        destination.parent,
+                        f"{destination.stem}~{digest}{destination.suffix}",
+                    )
+                counter = 0
+                original = destination
+                while str(destination).casefold() in used_paths:
+                    counter += 1
+                    digest = hashlib.sha256(f"{remote.identity or remote.url}:{counter}".encode()).hexdigest()[:16]
+                    destination = bounded_child_path(original.parent, f"{original.stem}~{digest}{original.suffix}")
+                used_paths.add(str(destination).casefold())
+                jobs[destination] = remote
 
         total_files = len(jobs)
         if not total_files:
@@ -872,28 +1009,28 @@ class BlackboardClient:
 
         def transfer(
             destination: Path, remote: RemoteFile
-        ) -> tuple[str, Path]:
+        ) -> tuple[str, Path, str]:
             self._check_cancel(cancel)
             if destination.is_dir():
                 if migrate_legacy_file_wrapper(destination):
-                    return "existing", destination
+                    return "existing", destination, ""
                 raise BlackboardError(
                     f"A folder named {destination.name} blocks that file's download. "
                     "Rename or remove the folder, then try again."
                 )
             if destination.exists():
-                return "existing", destination
+                return "existing", destination, ""
             if request_gate is not None:
                 request_gate.acquire()
             try:
                 self._check_cancel(cancel)
                 try:
-                    saved, was_downloaded = worker_client()._download_file(
-                        remote.url, destination, cancel
+                    saved, was_downloaded = worker_client()._download_remote(
+                        remote, destination, cancel
                     )
-                except FileUnavailableError:
-                    return "unavailable", destination
-                return ("downloaded" if was_downloaded else "existing"), saved
+                except FileUnavailableError as exc:
+                    return "unavailable", destination, str(exc)
+                return ("downloaded" if was_downloaded else "existing"), saved, ""
             finally:
                 if request_gate is not None:
                     request_gate.release()
@@ -909,7 +1046,7 @@ class BlackboardClient:
                 }
                 for future in as_completed(futures):
                     self._check_cancel(cancel)
-                    status, saved = future.result()
+                    status, saved, diagnostic = future.result()
                     completed += 1
                     if status == "downloaded":
                         downloaded += 1
@@ -921,7 +1058,7 @@ class BlackboardClient:
                         unavailable += 1
                         progress(
                             "log",
-                            f"Unavailable on Blackboard: {saved.name}",
+                            f"Link inaccessible (not necessarily deleted): {saved.name}: {diagnostic}",
                             0,
                             0,
                         )
@@ -938,81 +1075,67 @@ class BlackboardClient:
 
     def _paged_json(self, url: str, missing_ok: bool = False) -> list[dict]:
         results: list[dict] = []
-        while url:
+        visited: set[str] = set()
+        while url and url not in visited:
+            visited.add(url)
             response = self._get(url, timeout=30)
-            # Blackboard returns 400 for optional collections that do not apply
-            # to a content handler (for example, children on a document item).
-            if missing_ok and response.status_code in {400, 404, 405}:
-                return results
-            if response.status_code in {401, 403}:
-                raise AuthenticationError(
-                    "Your Blackboard session expired. Sign in again."
-                )
-            if response.status_code != 200:
-                raise BlackboardError(
-                    f"Blackboard returned HTTP {response.status_code} while loading data."
-                )
             try:
-                data = response.json()
-            except ValueError as exc:
-                raise BlackboardError(
-                    "Blackboard returned an unreadable response. Your session may have expired."
-                ) from exc
+                # Optional collections may be unavailable to a handler or this user.
+                if missing_ok and response.status_code in {400, 403, 404, 405, 501}:
+                    return results
+                if response.status_code in {401, 403}:
+                    raise AuthenticationError(
+                        "Your Blackboard session expired or this collection is not permitted."
+                    )
+                if response.status_code != 200:
+                    raise BlackboardError(
+                        f"Blackboard returned HTTP {response.status_code} while loading data."
+                    )
+                try:
+                    data = response.json()
+                except ValueError as exc:
+                    raise BlackboardError(
+                        "Blackboard returned an unreadable response. Your session may have expired."
+                    ) from exc
+            finally:
+                response.close()
             results.extend(data.get("results", []))
             next_page = data.get("paging", {}).get("nextPage")
-            url = urljoin(self.base_url, next_page) if next_page else ""
+            url = resolve_content_url(next_page, url) if next_page else ""
+            if url and urlparse(url).netloc != urlparse(self.base_url).netloc:
+                raise BlackboardError("Blackboard supplied an off-site collection page.")
         return results
 
-    def _collect_files(
-        self,
-        course_id: str,
-        root_id: str,
-        extensions: set[str],
-        cancel: threading.Event,
-    ) -> list[RemoteFile]:
-        files: list[RemoteFile] = []
-        visited: set[str] = set()
 
-        def visit(item_id: str) -> None:
-            self._check_cancel(cancel)
-            if not item_id or item_id in visited:
-                return
-            visited.add(item_id)
-            item_url = f"{self.base_url}/learn/api/public/v1/courses/{course_id}/contents/{item_id}"
+    def _file_identity(self, url: str) -> str:
+        parsed = urlparse(url)
+        origin = urlparse(self.base_url)
+        if (parsed.scheme, parsed.netloc.casefold()) == (origin.scheme, origin.netloc.casefold()):
+            match = re.search(r"/bbcswebdav/(?:[^?#]*/)?xid-(\d+_\d+)/?$", parsed.path)
+            if match:
+                return f"{self.base_url}/bbcswebdav/xid-{match.group(1)}"
+        return url
 
-            detail = self.session.get(item_url, timeout=30)
-            if detail.status_code == 200:
-                files.extend(self._extract_body_files(detail.json().get("body", ""), extensions))
-
-            attachments = self._paged_json(
-                f"{item_url}/attachments?limit=100", missing_ok=True
-            )
-            for attachment in attachments:
-                filename = attachment.get("fileName", "")
-                mime_type = attachment.get("mimeType", "")
-                attachment_id = attachment.get("id")
-                if attachment_id and self._matches(filename, mime_type, extensions):
-                    files.append(
-                        RemoteFile(
-                            url=f"{item_url}/attachments/{attachment_id}/download",
-                            filename=filename or "download",
-                            extension=detected_extension(filename, mime_type),
-                        )
-                    )
-
-            children = self._paged_json(
-                f"{item_url}/children?limit=100", missing_ok=True
-            )
-            for child in children:
-                visit(child.get("id", ""))
-
-        visit(root_id)
-        return files
+    @staticmethod
+    def _merge_files(files: Iterable[RemoteFile]) -> list[RemoteFile]:
+        merged: dict[str, RemoteFile] = {}
+        for remote in files:
+            key = remote.identity or remote.url
+            previous = merged.get(key)
+            if previous is None:
+                merged[key] = remote
+            else:
+                alternatives = tuple(dict.fromkeys(
+                    value for value in (*previous.alternatives, remote.url, *remote.alternatives)
+                    if value != previous.url
+                ))
+                merged[key] = replace(previous, alternatives=alternatives)
+        return list(merged.values())
 
     def _extract_body_files(
         self, body: str, extensions: set[str] | None
     ) -> list[RemoteFile]:
-        if not body:
+        if not isinstance(body, str) or not body:
             return []
         try:
             from bs4 import BeautifulSoup
@@ -1022,63 +1145,143 @@ class BlackboardClient:
             ) from exc
         files: list[RemoteFile] = []
         soup = BeautifulSoup(body, "html.parser")
-        for anchor in soup.find_all("a"):
-            encoded = anchor.get("data-bbfile")
-            if encoded:
-                try:
-                    info = json.loads(encoded)
-                    filename = info.get("displayName") or info.get("linkName", "")
-                    mime_type = info.get("mimeType", "")
-                    url = info.get("resourceUrl") or anchor.get("href", "")
-                    extension = detected_extension(filename, mime_type)
-                    if (
-                        url
-                        and is_downloadable_extension(extension)
-                        and (extensions is None or extension in extensions)
-                    ):
-                        files.append(
-                            RemoteFile(
-                                urljoin(self.base_url, url),
-                                filename or "download",
-                                extension,
-                            )
-                        )
-                except (json.JSONDecodeError, TypeError, AttributeError):
-                    pass
+        for element in soup.find_all(["a", "img", "audio", "video", "source", "object"]):
+            try:
+                info = json.loads(element.get("data-bbfile", "{}"))
+                if not isinstance(info, dict):
+                    info = {}
+            except (ValueError, TypeError):
+                info = {}
+            advertised = element.get("href") if element.name == "a" else element.get(
+                "data" if element.name == "object" else "src"
+            )
+            url = resolve_content_url(advertised or "", self.base_url)
+            resource = resolve_content_url(info.get("resourceUrl", ""), self.base_url)
+            url = url or resource
+            if not url:
                 continue
-
-            href = anchor.get("href", "")
-            filename = unquote(urlparse(href).path.rsplit("/", 1)[-1])
-            extension = detected_extension(filename)
-            if (
-                href
-                and is_downloadable_extension(extension)
-                and (extensions is None or extension in extensions)
-            ):
-                files.append(RemoteFile(urljoin(self.base_url, href), filename, extension))
-        return files
+            path_name = unquote(urlparse(url).path.rsplit("/", 1)[-1])
+            mime = info.get("mimeType") or element.get("type") or ""
+            if not isinstance(mime, str):
+                mime = ""
+            explicit = bool(info) or element.has_attr("download") or element.name != "a"
+            candidates = [
+                info.get("linkName"), info.get("displayName"), element.get("download"),
+                element.get_text(" ", strip=True), element.get("title"), path_name,
+            ]
+            filename = ""
+            for index, name in enumerate(candidates):
+                if not isinstance(name, str):
+                    continue
+                suffix = detected_extension(name)
+                if not suffix or (not explicit and not is_downloadable_extension(suffix)):
+                    continue
+                if index >= 3 and suffix in {".action", ".asp", ".aspx", ".cgi", ".do", ".jsp", ".php"}:
+                    continue
+                filename = name
+                break
+            identity = self._file_identity(url)
+            is_xythos = identity != url or "/bbcswebdav/xid-" in identity
+            extension = detected_extension(filename, mime)
+            if not extension and is_xythos:
+                extension = ".bin"
+            if not extension or (not explicit and not is_downloadable_extension(extension)):
+                continue
+            # Server-side navigation is not a file merely because its label has a suffix.
+            if detected_extension(path_name) in IGNORED_WEB_EXTENSIONS and not explicit and not mime:
+                continue
+            if extensions is not None and extension not in extensions:
+                continue
+            if not filename:
+                label = next((name for name in candidates if isinstance(name, str)
+                              and name.strip()), "download")
+                filename = f"{Path(label).stem or 'download'}{extension}"
+            alternatives = (resource,) if resource and resource != url and (
+                self._file_identity(resource) == identity
+            ) else ()
+            files.append(RemoteFile(url, filename, extension, alternatives, identity))
+        return self._merge_files(files)
 
     @staticmethod
     def _matches(filename: str, mime_type: str, extensions: set[str]) -> bool:
         extension = detected_extension(filename, mime_type)
         return is_downloadable_extension(extension) and extension in extensions
 
+    def _refresh_file(self, remote: RemoteFile) -> tuple[str, ...]:
+        if not remote.source_url or not remote.identity:
+            return ()
+        response = self._get(remote.source_url, timeout=30,
+                             params={"includeInActivityTracking": "false"}
+                             if "/contents/" in remote.source_url else None)
+        try:
+            if response.status_code != 200:
+                return ()
+            item = response.json()
+        finally:
+            response.close()
+        if "/resources/" in remote.source_url and remote.identity == remote.source_url:
+            url = resolve_content_url(item.get("downloadUrl", ""), self.base_url)
+            return (url,) if url else ()
+        refreshed = [
+            candidate for field in ("body", "description")
+            for candidate in self._extract_body_files(item.get(field, ""), None)
+            if candidate.identity == remote.identity
+        ]
+        return tuple(dict.fromkeys(url for candidate in refreshed
+                                   for url in (candidate.url, *candidate.alternatives)))
+
+    def _download_remote(
+        self, remote: RemoteFile, destination: Path, cancel: threading.Event
+    ) -> tuple[Path, bool]:
+        from requests import RequestException
+
+        if remote.content is not None:
+            self._check_cancel(cancel)
+            if destination.exists():
+                return destination, False
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            partial = destination.with_name(f"{destination.name}.part")
+            try:
+                partial.write_bytes(remote.content)
+                self._check_cancel(cancel)
+                partial.replace(destination)
+            finally:
+                partial.unlink(missing_ok=True)
+            return destination, True
+        attempted: set[str] = set()
+        errors = []
+        urls = (remote.url, *remote.alternatives)
+        for refresh in (False, True):
+            if refresh:
+                self._check_cancel(cancel)
+                try:
+                    urls = self._refresh_file(remote)
+                except (ValueError, RequestException):
+                    urls = ()
+            for url in urls:
+                self._check_cancel(cancel)
+                if url in attempted:
+                    continue
+                attempted.add(url)
+                try:
+                    return self._download_file(url, destination, cancel)
+                except FileUnavailableError as exc:
+                    errors.append(str(exc))
+                except RequestException:
+                    errors.append(f"Network error at {urlparse(url).path}: {destination.name}")
+        raise FileUnavailableError("; ".join(errors) or f"No accessible link: {destination.name}")
+
     def _download_file(
         self, url: str, destination: Path, cancel: threading.Event
     ) -> tuple[Path, bool]:
-        response = self.session.get(url, stream=True, allow_redirects=True, timeout=(30, 120))
-        if response.status_code in {401, 403}:
+        response = self._get(url, stream=True, allow_redirects=True, timeout=(30, 120))
+        if response.status_code == 401 and urlparse(url).netloc == urlparse(self.base_url).netloc:
             response.close()
             raise AuthenticationError("Your Blackboard session expired. Sign in again.")
-        if response.status_code in {404, 410}:
-            response.close()
-            raise FileUnavailableError(
-                f"Blackboard no longer provides this file: {destination.name}"
-            )
         if response.status_code != 200:
             response.close()
-            raise BlackboardError(
-                f"A file download failed with HTTP {response.status_code}: {destination.name}"
+            raise FileUnavailableError(
+                f"HTTP {response.status_code} at {urlparse(url).path}: {destination.name}"
             )
 
         # Keep the preallocated name: response filenames can collide across workers.
@@ -1091,9 +1294,30 @@ class BlackboardClient:
         try:
             destination.parent.mkdir(parents=True, exist_ok=True)
             with partial.open("wb") as handle:
+                prefix = bytearray()
                 for chunk in response.iter_content(chunk_size=64 * 1024):
                     self._check_cancel(cancel)
                     if chunk:
+                        if len(prefix) < 4096:
+                            prefix.extend(chunk[:4096 - len(prefix)])
+                            start = bytes(prefix).lstrip().lower()
+                            html = start.startswith((b"<!doctype html", b"<html", b"<head", b"<body"))
+                            content_type = response.headers.get("Content-Type", "").lower()
+                            if (html or content_type.startswith("text/html")) and destination.suffix.lower() not in {".html", ".htm"}:
+                                raise FileUnavailableError(
+                                    f"HTML/login page instead of a file at {urlparse(url).path}"
+                                )
+                            response_url = getattr(response, "url", "")
+                            login_route = isinstance(response_url, str) and bool(
+                                re.search(r"/(?:login|signon|webapps/login)(?:[/.?]|$)", response_url, re.I)
+                            )
+                            if (html or content_type.startswith("text/html")) and (
+                                login_route or any(marker in start for marker in (
+                                    b'type="password"', b"type='password'",
+                                    b'name="password"', b"name='password'",
+                                ))
+                            ):
+                                raise FileUnavailableError(f"Login page at {urlparse(url).path}")
                         handle.write(chunk)
             partial.replace(destination)
         except OSError as exc:
