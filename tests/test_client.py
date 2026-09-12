@@ -170,35 +170,55 @@ class ClientHelpersTest(unittest.TestCase):
             )
         response.close.assert_called_once()
 
-    def test_alternate_url_can_recover_same_logical_file(self):
-        client = object.__new__(BlackboardClient)
-        client._download_file = Mock(
-            side_effect=[
-                FileUnavailableError("stale URL"),
-                (Path("Problems.pdf"), True),
-            ]
-        )
-        client.create_worker_client = Mock(return_value=client)
-        client.close = Mock()
-        files = (
-            RemoteFile("https://example.test/stale", "Problems.pdf", ".pdf"),
-            RemoteFile("https://example.test/current", "Problems.pdf", ".pdf"),
-        )
-        selection = CourseSelection(
-            Course("course", "Course", "CODE", "Term"),
-            (ContentNode("content", "CA1", files),),
-        )
-        messages = []
-        with tempfile.TemporaryDirectory() as directory:
-            result = client.download_courses(
-                [selection],
-                Path(directory),
-                {".pdf"},
-                lambda kind, message, _current, _total: messages.append((kind, message)),
-                threading.Event(),
-            )
-        self.assertEqual(result, (1, 0, 0))
-        self.assertFalse(any("Unavailable on Blackboard" in message for _, message in messages))
+    def test_multiple_post_pdfs_survive_name_collisions_and_repeat_downloads(self):
+        for names in [
+            ("notes.pdf", "notes.pdf"),
+            ("notes.pdf", "NOTES.pdf"),
+            ("notes?.pdf", "notes*.pdf"),
+            ("download", "download"),
+            ("first.pdf", "second.pdf"),
+        ]:
+            with self.subTest(names=names), tempfile.TemporaryDirectory() as directory:
+                client = object.__new__(BlackboardClient)
+                client.session = Mock()
+
+                def response_for(url, **_kwargs):
+                    response = Mock(status_code=200)
+                    response.headers = {
+                        "Content-Disposition": 'attachment; filename="notes.pdf"'
+                    }
+                    response.iter_content.return_value = [url.encode()]
+                    return response
+
+                client.session.get.side_effect = response_for
+                client.create_worker_client = lambda: client
+                client.close = Mock()
+                files = tuple(
+                    RemoteFile(f"https://example.test/{index}", name, ".pdf")
+                    for index, name in enumerate(names)
+                )
+                selection = CourseSelection(
+                    Course("course", "Course", "", ""),
+                    (ContentNode("post", "Documents.pdf", files + (files[0],)),),
+                )
+                events = []
+
+                def download():
+                    return client.download_courses(
+                        [selection], Path(directory), {".pdf"},
+                        lambda *event: events.append(event), threading.Event(),
+                    )
+
+                self.assertEqual(download(), (2, 0, 0))
+                saved = list((Path(directory) / "Course" / "Documents.pdf").glob("*.pdf"))
+                self.assertEqual(
+                    {path.read_bytes() for path in saved},
+                    {remote.url.encode() for remote in files},
+                )
+                self.assertEqual(download(), (0, 2, 0))
+                self.assertEqual(
+                    [event for event in events if event[0] == "file"][-1][2:], (2, 2)
+                )
 
     def test_repeated_folder_titles_are_collapsed(self):
         client = object.__new__(BlackboardClient)

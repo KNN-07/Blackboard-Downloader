@@ -235,13 +235,11 @@ def filter_content_nodes(
 
 def is_file_wrapper_node(node: ContentNode) -> bool:
     """Identify Blackboard leaf nodes that merely wrap one downloadable file."""
-    if node.children or not node.files:
+    if node.children or len(node.files) != 1:
         return False
     title = _clean_name(node.title, "Untitled content")
     if is_downloadable_extension(Path(title).suffix.lower()):
         return True
-    if len(node.files) != 1:
-        return False
     filename = _clean_name(node.files[0].filename, "download")
     return title.casefold() in {filename.casefold(), Path(filename).stem.casefold()}
 
@@ -798,13 +796,14 @@ class BlackboardClient:
         skipped = 0
         unavailable = 0
         output_dir.mkdir(parents=True, exist_ok=True)
-        jobs: dict[Path, list[RemoteFile]] = {}
+        jobs: dict[Path, RemoteFile] = {}
+        used_paths: set[str] = set()
+        seen_files: set[tuple[str, str]] = set()
 
         for selection in selections:
             self._check_cancel(cancel)
             course = selection.course
             course_dir = bounded_child_path(output_dir, course.name, directory=True)
-            candidates: dict[Path, list[RemoteFile]] = {}
             logged_directories: set[Path] = set()
 
             def collect_node(node: ContentNode, parent: Path) -> None:
@@ -827,19 +826,30 @@ class BlackboardClient:
                     self._check_cancel(cancel)
                     if remote.extension not in extensions:
                         continue
-                    destination = bounded_child_path(
-                        node_dir, remote.filename, directory=False
-                    )
-                    candidates.setdefault(destination, []).append(remote)
+                    identity = (str(node_dir).casefold(), remote.url)
+                    if identity in seen_files:
+                        continue
+                    seen_files.add(identity)
+                    filename = _clean_name(remote.filename, "download")
+                    if not Path(filename).suffix:
+                        filename += remote.extension
+                    destination = bounded_child_path(node_dir, filename, directory=False)
+                    number = 2
+                    while str(destination).casefold() in used_paths:
+                        destination = bounded_child_path(
+                            node_dir,
+                            f"{Path(filename).stem} ({number}){Path(filename).suffix}",
+                            directory=False,
+                        )
+                        number += 1
+                    used_paths.add(str(destination).casefold())
+                    jobs[destination] = remote
 
                 for child in node.children:
                     collect_node(child, node_dir)
 
             for root in selection.contents:
                 collect_node(root, course_dir)
-
-            for destination, alternatives in candidates.items():
-                jobs.setdefault(destination, []).extend(alternatives)
 
         total_files = len(jobs)
         if not total_files:
@@ -861,7 +871,7 @@ class BlackboardClient:
             return worker
 
         def transfer(
-            destination: Path, alternatives: list[RemoteFile]
+            destination: Path, remote: RemoteFile
         ) -> tuple[str, Path]:
             self._check_cancel(cancel)
             if destination.is_dir():
@@ -876,20 +886,14 @@ class BlackboardClient:
             if request_gate is not None:
                 request_gate.acquire()
             try:
-                attempted_urls: set[str] = set()
-                for remote in alternatives:
-                    self._check_cancel(cancel)
-                    if remote.url in attempted_urls:
-                        continue
-                    attempted_urls.add(remote.url)
-                    try:
-                        saved, was_downloaded = worker_client()._download_file(
-                            remote.url, destination, cancel
-                        )
-                    except FileUnavailableError:
-                        continue
-                    return ("downloaded" if was_downloaded else "existing"), saved
-                return "unavailable", destination
+                self._check_cancel(cancel)
+                try:
+                    saved, was_downloaded = worker_client()._download_file(
+                        remote.url, destination, cancel
+                    )
+                except FileUnavailableError:
+                    return "unavailable", destination
+                return ("downloaded" if was_downloaded else "existing"), saved
             finally:
                 if request_gate is not None:
                     request_gate.release()
@@ -900,8 +904,8 @@ class BlackboardClient:
                 max_workers=4, thread_name_prefix="bb-download"
             ) as executor:
                 futures = {
-                    executor.submit(transfer, destination, alternatives): destination
-                    for destination, alternatives in jobs.items()
+                    executor.submit(transfer, destination, remote): destination
+                    for destination, remote in jobs.items()
                 }
                 for future in as_completed(futures):
                     self._check_cancel(cancel)
@@ -1077,14 +1081,7 @@ class BlackboardClient:
                 f"A file download failed with HTTP {response.status_code}: {destination.name}"
             )
 
-        disposition = response.headers.get("Content-Disposition", "")
-        match = re.search(r"filename\*?=(?:UTF-8''|[\"']?)([^\"';\r\n]+)", disposition, re.I)
-        if match:
-            server_name = safe_name(unquote(match.group(1)))
-            if Path(server_name).suffix:
-                destination = bounded_child_path(
-                    destination.parent, server_name, directory=False
-                )
+        # Keep the preallocated name: response filenames can collide across workers.
 
         if destination.exists():
             response.close()

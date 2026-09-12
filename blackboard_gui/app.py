@@ -6,11 +6,13 @@ import queue
 import subprocess
 import sys
 import threading
+import webbrowser
 import tkinter as tk
 from io import BytesIO
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from . import __version__
 from .branding_cache import BrandingCache
 from .client import (
     AuthenticationError,
@@ -26,6 +28,13 @@ from .client import (
 )
 from .dependencies import audit_dependencies, install_command
 from .secure_store import SessionStore, SessionStoreError
+from .updater import (
+    Release,
+    automatic_install_supported,
+    check_release,
+    download_update,
+    install_update,
+)
 
 
 COLORS = {
@@ -116,6 +125,14 @@ class BlackboardApp(tk.Tk):
         self.log_has_content = False
 
         settings = self._load_settings()
+        self.check_updates_var = tk.BooleanVar(value=settings.get("check_updates", True))
+        self.auto_update_var = tk.BooleanVar(value=settings.get("auto_update", False))
+        self.update_cancel = threading.Event()
+        self.update_running = False
+        self.installing_update = False
+        self.available_update: Release | None = None
+        self.pending_update: Path | None = None
+        self.update_status = tk.StringVar(value=f"Version {__version__}")
         default_destination = Path.home() / "Downloads" / "Blackboard"
         self.url_var = tk.StringVar(value=settings.get("url", ""))
         self.destination_var = tk.StringVar(
@@ -138,9 +155,11 @@ class BlackboardApp(tk.Tk):
 
         self._configure_styles()
         self._build_ui()
+        self._build_update_menu()
         self.bind("<Escape>", lambda _event: self._cancel_download() if self.downloading else None)
         self.after(100, self._drain_events)
         self.after(300, self._audit_environment)
+        self.after(1500, self._scheduled_update_check)
 
     def _configure_window_icon(self) -> None:
         try:
@@ -530,6 +549,9 @@ class BlackboardApp(tk.Tk):
         )
         self.log.grid(row=1, column=0, sticky="ew")
         self._set_log_placeholder("Waiting to connect.")
+        ttk.Label(
+            download, textvariable=self.update_status, style="Muted.TLabel",
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
     def _step_header(
         self,
@@ -879,6 +901,8 @@ class BlackboardApp(tk.Tk):
     def _ensure_course_loaded(
         self, course_id: str, select_after: int | None = None
     ) -> None:
+        if self.installing_update:
+            return
         state = self.course_load_states.get(course_id)
         if state == "loaded":
             if select_after is not None:
@@ -1214,6 +1238,192 @@ class BlackboardApp(tk.Tk):
         self.cancel_button.configure(state="disabled")
         self._set_status("Cancelling safely…", "working")
 
+    def _build_update_menu(self) -> None:
+        menu = tk.Menu(self)
+        updates = tk.Menu(menu, tearoff=False)
+        updates.add_command(label=f"Version {__version__}", state="disabled")
+        updates.add_command(label="Check for updates", command=self._check_for_updates)
+        updates.add_command(label="Install available update", command=self._offer_update)
+        updates.add_separator()
+        updates.add_checkbutton(
+            label="Check automatically", variable=self.check_updates_var,
+            command=self._save_settings,
+        )
+        updates.add_checkbutton(
+            label="Install automatically when idle", variable=self.auto_update_var,
+            command=self._auto_update_changed,
+            state="normal" if automatic_install_supported() else "disabled",
+        )
+        updates.add_command(
+            label="View releases", command=lambda: webbrowser.open(
+                "https://github.com/KNN-07/Blackboard-Downloader/releases"
+            ),
+        )
+        menu.add_cascade(label="Updates", menu=updates)
+        self.configure(menu=menu)
+
+    def _auto_update_changed(self) -> None:
+        if self.auto_update_var.get():
+            if not messagebox.askyesno(
+                "Enable automatic updates?",
+                "New stable releases will be downloaded, verified, and installed when "
+                "Blackboard work is idle. The app will close for installation and restart. "
+                "Your operating system may ask for permission.",
+                parent=self,
+            ):
+                self.auto_update_var.set(False)
+            else:
+                self.check_updates_var.set(True)
+        self._save_settings()
+
+    def _scheduled_update_check(self) -> None:
+        if self.check_updates_var.get():
+            self._check_for_updates(manual=False)
+        self.after(24 * 60 * 60 * 1000, self._scheduled_update_check)
+
+    def _check_for_updates(self, manual: bool = True) -> None:
+        if self.update_running or self.pending_update is not None:
+            if manual:
+                messagebox.showinfo("Updates", self.update_status.get(), parent=self)
+            return
+        self.update_running = True
+        self.update_status.set("Checking for updates…")
+
+        def worker() -> None:
+            try:
+                self.events.put(("update_checked", check_release(__version__), manual))
+            except Exception as exc:
+                self.events.put(("update_error", str(exc), manual))
+
+        threading.Thread(target=worker, daemon=True, name="bb-update-check").start()
+
+    def _update_idle(self) -> bool:
+        return (
+            not self.busy
+            and not self.downloading
+            and str(self.signed_in_button["state"]) == "disabled"
+            and not any(state == "loading" for state in self.course_load_states.values())
+        )
+
+    def _offer_update(self) -> None:
+        if self.update_running or self.pending_update is not None:
+            messagebox.showinfo("Updates", self.update_status.get(), parent=self)
+            return
+        release = self.available_update
+        if release is None:
+            self._check_for_updates()
+            return
+        if not automatic_install_supported():
+            if messagebox.askyesno(
+                "Update available",
+                f"Version {release.version} is available (installed: {__version__}).\n\n"
+                "This source checkout or installation cannot be replaced automatically. "
+                "Open the release page for installation instructions?",
+                parent=self,
+            ):
+                webbrowser.open(release.url)
+            return
+        if messagebox.askyesno(
+            "Install update?",
+            f"Download and install version {release.version}?\n\n"
+            "The app will close and restart once Blackboard work is idle. "
+            "Operating-system permission may be required.",
+            parent=self,
+        ):
+            self._download_update(release)
+
+    def _download_update(self, release: Release) -> None:
+        if self.update_running:
+            return
+        self.update_running = True
+        self.update_cancel.clear()
+        self.update_status.set(f"Downloading version {release.version}…")
+        self._append_log(self.update_status.get())
+
+        def worker() -> None:
+            try:
+                path = download_update(
+                    release, self.update_cancel,
+                    lambda current, total: self.events.put(
+                        ("update_progress", current, total)
+                    ),
+                )
+                self.events.put(("update_ready", path))
+            except Exception as exc:
+                self.events.put(("update_error", str(exc), True))
+
+        threading.Thread(target=worker, daemon=True, name="bb-update-download").start()
+
+    def _install_pending_update(self) -> None:
+        if self.pending_update is None or self.installing_update:
+            return
+        if not self._update_idle():
+            self.after(1000, self._install_pending_update)
+            return
+        path = self.pending_update
+        self.installing_update = True
+        self.update_running = True
+        self.update_status.set("Preparing update installation…")
+        self._set_busy(True, "Preparing update installation…", indeterminate=True)
+
+        def worker() -> None:
+            try:
+                install_update(path)
+                self.events.put(("update_install_started",))
+            except Exception as exc:
+                self.events.put(("update_install_error", str(exc)))
+
+        threading.Thread(target=worker, daemon=True, name="bb-update-install").start()
+
+    def _handle_update_event(self, event: tuple) -> None:
+        kind = event[0]
+        if kind == "update_checked":
+            _, release, manual = event
+            self.update_running = False
+            self.available_update = release
+            if release is None:
+                self.update_status.set(f"Version {__version__} is up to date")
+                if manual:
+                    messagebox.showinfo("Updates", self.update_status.get(), parent=self)
+                return
+            self.update_status.set(f"Version {release.version} is available")
+            self._append_log(self.update_status.get() + " — use the Updates menu to install.")
+            if self.auto_update_var.get() and automatic_install_supported():
+                self._download_update(release)
+            elif manual:
+                self._offer_update()
+        elif kind == "update_progress":
+            _, current, total = event
+            self.update_status.set(
+                f"Downloading update: {current * 100 // total}%"
+                if total else f"Downloading update: {current // 1024} KB"
+            )
+        elif kind == "update_ready":
+            self.update_running = False
+            self.pending_update = event[1]
+            self.update_status.set("Update verified; waiting for Blackboard work to finish")
+            self._append_log(self.update_status.get())
+            self.after(100, self._install_pending_update)
+        elif kind == "update_install_started":
+            self.installing_update = False
+            self.pending_update = None
+            self.after_idle(self._on_close)
+        elif kind == "update_install_error":
+            self.installing_update = False
+            self.update_running = False
+            self.pending_update = None
+            self._set_busy(False, "Update installation failed")
+            self.update_status.set("Update installation failed")
+            self._append_log(f"Update installation failed: {event[1]}")
+            messagebox.showerror("Could not install update", event[1], parent=self)
+        elif kind == "update_error":
+            _, error, manual = event
+            self.update_running = False
+            self.update_status.set("Update failed")
+            self._append_log(f"Update failed: {error}")
+            if manual:
+                messagebox.showerror("Update failed", error, parent=self)
+
     def _queue_progress(self, kind: str, message: str, current: int, total: int) -> None:
         self.events.put(("progress", kind, message, current, total))
 
@@ -1222,6 +1432,9 @@ class BlackboardApp(tk.Tk):
             while True:
                 event = self.events.get_nowait()
                 kind = event[0]
+                if kind.startswith("update_"):
+                    self._handle_update_event(event)
+                    continue
                 if kind == "login_open":
                     self._set_busy(False, "Waiting for sign-in")
                     self._set_status("Waiting for sign-in", "working")
@@ -1557,6 +1770,8 @@ class BlackboardApp(tk.Tk):
                         "url": self.url_var.get().strip(),
                         "destination": self.destination_var.get().strip(),
                         "remember_session": self.remember_var.get(),
+                        "check_updates": self.check_updates_var.get(),
+                        "auto_update": self.auto_update_var.get(),
                         "extensions": sorted(
                             extension
                             for extension, selected in self.extension_preferences.items()
@@ -1571,6 +1786,13 @@ class BlackboardApp(tk.Tk):
             pass
 
     def _on_close(self) -> None:
+        if self.installing_update:
+            messagebox.showinfo(
+                "Preparing update", "Please wait for update preparation to finish.",
+                parent=self,
+            )
+            return
+        self.update_cancel.set()
         self.cancel_event.set()
         for cancel in self.content_cancel_events.values():
             cancel.set()

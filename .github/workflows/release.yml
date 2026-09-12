@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Version embedded in installer filenames
+        description: Version embedded in the application and installer filenames
         required: true
-        default: 0.1.0-dev
+        default: 0.2.0
         type: string
   push:
     tags:
@@ -56,17 +56,38 @@ jobs:
 
       - name: Resolve version
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             version="${GITHUB_REF_NAME#v}"
           else
-            version="${{ inputs.version }}"
+            version="$INPUT_VERSION"
           fi
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([._-][0-9A-Za-z.-]+)?$ ]]; then
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
             echo "Invalid version: $version" >&2
             exit 1
           fi
+          python -c 'import sys; from blackboard_gui.updater import _version; _version(sys.argv[1])' "$version"
           echo "APP_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Stamp application version
+        shell: python {0}
+        run: |
+          import os
+          import re
+          from pathlib import Path
+
+          path = Path("blackboard_gui/__init__.py")
+          source, count = re.subn(
+              r'^__version__ = "[^"]*"$',
+              f'__version__ = "{os.environ["APP_VERSION"]}"',
+              path.read_text(encoding="utf-8"),
+              flags=re.MULTILINE,
+          )
+          if count != 1:
+              raise SystemExit("Expected exactly one application version declaration")
+          path.write_text(source, encoding="utf-8")
 
       - name: Install build dependencies
         run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt pyinstaller
@@ -151,9 +172,38 @@ jobs:
           path: release
           merge-multiple: true
 
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Generate checksums and classify release
+        id: metadata
+        shell: python {0}
+        run: |
+          import hashlib
+          import os
+          import re
+          from pathlib import Path
+
+          directory = Path("release")
+          artifacts = sorted(path for path in directory.iterdir() if path.is_file())
+          if not artifacts or any(path.name == "SHA256SUMS" for path in artifacts):
+              raise SystemExit("Expected installer artifacts without an existing checksum manifest")
+          with (directory / "SHA256SUMS").open("w", encoding="utf-8", newline="\n") as manifest:
+              for path in artifacts:
+                  with path.open("rb") as artifact:
+                      checksum = hashlib.file_digest(artifact, "sha256").hexdigest()
+                  manifest.write(f"{checksum}  {path.name}\n")
+          version = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          prerelease = re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) is None
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"prerelease={str(prerelease).lower()}\n")
+
       - name: Publish release
         uses: softprops/action-gh-release@v3
         with:
           files: release/*
+          prerelease: ${{ steps.metadata.outputs.prerelease == 'true' }}
           generate_release_notes: true
           fail_on_unmatched_files: true

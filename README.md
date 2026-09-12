@@ -28,8 +28,9 @@ It is designed for Blackboard Ultra installations that expose Blackboard's publi
 - Downloads up to four files in parallel with file-level progress.
 - Preserves useful course and content folders while removing duplicate filename directories.
 - Skips existing files and safely removes incomplete `.part` files after cancellation.
-- Tries alternate Blackboard URLs before marking stale files unavailable.
+- Keeps distinct attachment URLs separate, adding numbered suffixes when filenames collide; unavailable files do not stop the remaining downloads.
 - Handles Windows path-length constraints and safely migrates the older `file.ext/file.ext` layout.
+- Checks GitHub Releases in the background and supports opt-in verified automatic updates.
 
 ## Requirements
 
@@ -95,7 +96,30 @@ The app also audits its Python environment at startup and provides the exact ins
 6. Choose from the file extensions discovered in the selected content.
 7. Select a destination and choose **Download selected**.
 
-The progress bar tracks unique logical files after duplicates are combined. Downloaded, already-existing, and unavailable files each advance progress exactly once.
+The progress bar tracks distinct file URLs within each destination folder. Repeated links to the same URL are combined, but different URLs with matching filenames are downloaded separately (for example, `notes.pdf` and `notes (2).pdf`). Catalog filenames are retained so server-provided names cannot overwrite another attachment. Downloaded, already-existing, and unavailable files each advance progress exactly once.
+
+## Application updates
+
+Open **Updates → Check for updates** to check manually. **Check automatically** is enabled by default: it checks shortly after launch and once every 24 hours while the app remains open. Only newer stable releases are offered; prereleases and downgrades are not installed.
+
+**Install available update** downloads and verifies the matching package. Enable **Install automatically when idle** to opt into downloading and installing future updates without another confirmation. Installation waits for sign-in, course indexing, and course downloads to finish. The app closes for installation and restarts afterward; operating-system authorization may still be required. Both preferences are saved locally.
+
+Supported automatic installation paths:
+
+| Installation | Update behavior |
+| --- | --- |
+| Windows x64 setup | Runs the new Inno Setup installer against the existing writable installation directory. |
+| Windows x64 portable | Replaces the executable after the running process exits. |
+| macOS Apple Silicon / Intel | Replaces a writable installed `.app` bundle. Copy it out of the disk image first. |
+| Linux x64 portable | Replaces the extracted executable in its writable directory. |
+| Debian package | Uses `pkexec` and `dpkg` to update `/usr/bin/blackboard-downloader`; authorization is required. |
+| Source checkout, unsupported architecture, or protected installation | Offers the release page without changing the checkout or installation. |
+
+Downloads use a separate HTTPS connection to this project's GitHub Releases, never your Blackboard session. Before installation, the updater verifies size and SHA-256 against GitHub's asset digest or the release's `SHA256SUMS`, then checks the staged file again. These integrity checks do not replace publisher code signing; the packages remain unsigned.
+
+The updater retains a uniquely named `.backup-*` executable or app bundle beside the installation. After confirming the new version works, you may remove that backup. Failed replacements attempt to restore and restart the old application. Post-exit installation details are written to `install.log` inside the system temporary directory's `blackboard-update-*` folder. A failed Debian transaction may still require `sudo apt --fix-broken install` to repair package-manager state.
+
+Existing releases without this updater need one manual installation of an updater-enabled release. Subsequent release builds embed their tag version and publish `SHA256SUMS` automatically.
 
 ## Session security and privacy
 
@@ -174,11 +198,11 @@ The **Build installers** workflow supports two release paths:
 - Push a version tag to build every platform and publish the results as a GitHub Release:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
-Version tags must begin with `v` and use a value such as `v0.1.0` or `v0.1.0-beta.1`.
+Version tags must begin with `v` and use a value such as `v0.2.0` or `v0.2.0-beta.1`.
 
 The release matrix produces:
 
