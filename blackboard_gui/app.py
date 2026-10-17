@@ -10,7 +10,7 @@ import webbrowser
 import tkinter as tk
 from io import BytesIO
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 from . import __version__
 from .branding_cache import BrandingCache
@@ -86,12 +86,29 @@ def configure_process_identity() -> None:
         pass
 
 
+def configure_dpi_awareness() -> None:
+    """Render crisply on scaled Windows displays instead of being bitmap-stretched."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)  # type: ignore[attr-defined]
+        except (AttributeError, OSError):
+            ctypes.windll.user32.SetProcessDPIAware()  # type: ignore[attr-defined]
+    except (AttributeError, OSError):
+        pass
+
+
 class BlackboardApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Blackboard Downloader")
-        self.geometry("900x760")
-        self.minsize(790, 660)
+        # Fonts are sized in points and follow the display scaling, but most
+        # layout metrics are pixels; scale those too so 150% displays keep
+        # the same proportions as 100% ones.
+        self.ui_scale = max(1.0, self.winfo_fpixels("1i") / 96)
         self.configure(bg=COLORS["bg"])
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.window_icon_image = None
@@ -111,6 +128,10 @@ class BlackboardApp(tk.Tk):
         self.content_errors: dict[str, str] = {}
         self.tree_meta: dict[str, tuple[str, str, str | None]] = {}
         self.tree_states: dict[str, int] = {}
+        # Whether a content row's own files are selected. Kept apart from the
+        # row's tick, which also reflects its children, so a folder's files
+        # stay selected when only some of its subfolders are.
+        self.file_selection: dict[str, bool] = {}
         self.tree_labels: dict[str, str] = {}
         self.course_tree_items: dict[str, str] = {}
         self.content_tree_items: dict[tuple[str, str], str] = {}
@@ -156,6 +177,7 @@ class BlackboardApp(tk.Tk):
         self._configure_styles()
         self._build_ui()
         self._build_update_menu()
+        self._fit_to_screen()
         self.bind("<Escape>", lambda _event: self._cancel_download() if self.downloading else None)
         self.after(100, self._drain_events)
         self.after(300, self._audit_environment)
@@ -178,14 +200,29 @@ class BlackboardApp(tk.Tk):
             except tk.TclError:
                 pass
 
+    def _px(self, value: float) -> int:
+        return round(value * self.ui_scale)
+
     def _configure_styles(self) -> None:
+        px = self._px
+        for name in ("TkDefaultFont", "TkTextFont"):
+            tkfont.nametofont(name).configure(family=FONT, size=10)
         style = ttk.Style(self)
         style.theme_use("clam")
-        style.configure(".", font=(FONT, 10), background=COLORS["bg"], foreground=COLORS["ink"])
+        style.configure(
+            ".",
+            font=(FONT, 10),
+            background=COLORS["bg"],
+            foreground=COLORS["ink"],
+            bordercolor=COLORS["border"],
+            troughcolor=COLORS["surface"],
+            focuscolor=COLORS["focus"],
+        )
         style.configure("TFrame", background=COLORS["bg"])
         style.configure("Surface.TFrame", background=COLORS["surface"])
         style.configure("TLabel", background=COLORS["bg"], foreground=COLORS["ink"])
         style.configure("Muted.TLabel", foreground=COLORS["muted"])
+        style.configure("Placeholder.TLabel", foreground="#8d9891")
         style.configure(
             "SurfaceIdentity.TLabel",
             background=COLORS["surface"],
@@ -194,94 +231,208 @@ class BlackboardApp(tk.Tk):
         )
         style.configure("Surface.TLabel", background=COLORS["surface"], foreground=COLORS["ink"])
         style.configure("SurfaceMuted.TLabel", background=COLORS["surface"], foreground=COLORS["muted"])
-        style.configure("Title.TLabel", font=(FONT, 21, "bold"), foreground=COLORS["ink"])
+        style.configure("Title.TLabel", font=(FONT, 18, "bold"), foreground=COLORS["ink"])
         style.configure("Section.TLabel", font=(FONT, 12, "bold"), foreground=COLORS["ink"])
-        style.configure("Field.TLabel", font=(FONT, 9, "bold"), foreground=COLORS["ink"])
         style.configure(
             "SurfaceSection.TLabel",
             font=(FONT, 12, "bold"),
             background=COLORS["surface"],
             foreground=COLORS["ink"],
         )
+        style.configure("Field.TLabel", font=(FONT, 8, "bold"), foreground=COLORS["muted"])
+        style.configure(
+            "SurfaceField.TLabel",
+            font=(FONT, 8, "bold"),
+            background=COLORS["surface"],
+            foreground=COLORS["muted"],
+        )
+
+        # clam draws buttons with a light/dark bevel; matching those colours
+        # to the fill gives flat buttons with a single crisp border.
+        def flat(states: list[tuple[str, str]]) -> dict[str, list[tuple[str, str]]]:
+            return {"background": states, "lightcolor": states, "darkcolor": states}
+
+        style.configure(
+            "TButton",
+            padding=(px(14), px(7)),
+            borderwidth=1,
+            background=COLORS["bg"],
+            lightcolor=COLORS["bg"],
+            darkcolor=COLORS["bg"],
+            foreground=COLORS["ink"],
+            bordercolor=COLORS["border"],
+        )
+        style.map(
+            "TButton",
+            **flat([("disabled", COLORS["bg"]), ("pressed", COLORS["surface_hover"]), ("active", COLORS["surface"])]),
+            foreground=[("disabled", "#8d9891")],
+            bordercolor=[("disabled", "#e1e7e3"), ("focus", COLORS["focus"])],
+        )
         style.configure(
             "Primary.TButton",
+            padding=(px(18), px(7)),
             background=COLORS["primary"],
+            lightcolor=COLORS["primary"],
+            darkcolor=COLORS["primary"],
+            bordercolor=COLORS["primary"],
             foreground="white",
-            padding=(17, 10),
-            borderwidth=0,
             font=(FONT, 10, "bold"),
         )
         style.map(
             "Primary.TButton",
-            background=[("pressed", COLORS["primary_hover"]), ("active", COLORS["primary_hover"]), ("disabled", "#a8b3ac")],
+            **flat([("disabled", "#a8b3ac"), ("pressed", COLORS["primary_hover"]), ("active", COLORS["primary_hover"])]),
             foreground=[("disabled", "#edf1ee")],
+            bordercolor=[("disabled", "#a8b3ac"), ("focus", COLORS["focus"]), ("active", COLORS["primary_hover"])],
         )
-        style.configure(
-            "TButton",
-            padding=(13, 9),
-            borderwidth=1,
-            background=COLORS["bg"],
-            foreground=COLORS["ink"],
-            bordercolor=COLORS["border"],
-        )
-        style.map(
-            "TButton",
-            background=[("pressed", COLORS["surface_hover"]), ("active", COLORS["surface"]), ("disabled", COLORS["surface"])],
-            foreground=[("disabled", "#8d9891")],
-            bordercolor=[("focus", COLORS["focus"])],
-        )
-        style.configure(
-            "Quiet.TButton",
-            padding=(10, 6),
-            background=COLORS["bg"],
-            borderwidth=0,
-            foreground=COLORS["primary"],
-            font=(FONT, 9, "bold"),
-        )
-        style.map("Quiet.TButton", background=[("active", COLORS["primary_soft"]), ("pressed", COLORS["primary_soft"])])
+        for name, background, hover in (
+            ("Quiet", COLORS["bg"], COLORS["primary_soft"]),
+            ("SurfaceQuiet", COLORS["surface"], COLORS["surface_hover"]),
+        ):
+            style.configure(
+                f"{name}.TButton",
+                padding=(px(10), px(6)),
+                background=background,
+                lightcolor=background,
+                darkcolor=background,
+                bordercolor=background,
+                foreground=COLORS["primary"],
+                font=(FONT, 9, "bold"),
+            )
+            style.map(
+                f"{name}.TButton",
+                **flat([("disabled", background), ("pressed", hover), ("active", hover)]),
+                foreground=[("disabled", "#8d9891")],
+                bordercolor=[("focus", COLORS["focus"]), ("pressed", hover), ("active", hover)],
+            )
         style.configure(
             "TEntry",
-            padding=9,
+            padding=(px(9), px(6)),
             fieldbackground=COLORS["bg"],
+            foreground=COLORS["ink"],
             bordercolor=COLORS["border"],
-            lightcolor=COLORS["focus"],
-            darkcolor=COLORS["border"],
+            lightcolor=COLORS["bg"],
+            darkcolor=COLORS["bg"],
+            insertcolor=COLORS["ink"],
         )
-        style.configure("TCheckbutton", background=COLORS["bg"], foreground=COLORS["ink"])
-        style.configure("Surface.TCheckbutton", background=COLORS["surface"], foreground=COLORS["ink"])
         style.map(
-            "Surface.TCheckbutton",
-            background=[("active", COLORS["surface_hover"]), ("selected", COLORS["surface"])],
-            foreground=[("disabled", "#8d9891")],
+            "TEntry",
+            bordercolor=[("focus", COLORS["focus"])],
+            lightcolor=[("focus", COLORS["focus"])],
+            fieldbackground=[("disabled", COLORS["surface"])],
+            foreground=[("disabled", COLORS["muted"])],
         )
+
+        self._create_check_images()
+        images = self.check_images
+        style.element_create(
+            "Check.indicator",
+            "image",
+            images["off"],
+            ("disabled", "selected", images["on_disabled"]),
+            ("disabled", images["off_disabled"]),
+            ("selected", images["on"]),
+            ("active", images["off_hover"]),
+            sticky="w",
+        )
+        style.layout(
+            "TCheckbutton",
+            [
+                (
+                    "Checkbutton.padding",
+                    {
+                        "sticky": "nswe",
+                        "children": [
+                            ("Check.indicator", {"side": "left", "sticky": ""}),
+                            (
+                                "Checkbutton.focus",
+                                {
+                                    "side": "left",
+                                    "sticky": "w",
+                                    "children": [("Checkbutton.label", {"sticky": "nswe"})],
+                                },
+                            ),
+                        ],
+                    },
+                )
+            ],
+        )
+        for name, background in (("TCheckbutton", COLORS["bg"]), ("Surface.TCheckbutton", COLORS["surface"])):
+            style.configure(name, background=background, foreground=COLORS["ink"], padding=(0, px(3)))
+            style.map(name, background=[("active", background)], foreground=[("disabled", "#8d9891")])
+
+        body_font = tkfont.Font(self, family=FONT, size=10)
         style.configure(
             "Course.Treeview",
-            background=COLORS["surface"],
-            fieldbackground=COLORS["surface"],
+            background=COLORS["bg"],
+            fieldbackground=COLORS["bg"],
             foreground=COLORS["ink"],
-            borderwidth=0,
+            bordercolor=COLORS["border"],
+            lightcolor=COLORS["bg"],
+            darkcolor=COLORS["bg"],
+            borderwidth=1,
             relief="flat",
-            rowheight=28,
+            font=(FONT, 10),
+            rowheight=max(px(30), body_font.metrics("linespace") + px(12)),
+            indent=px(22),
+            indicatorsize=px(9),
+            indicatormargins=(px(2), px(2), px(6), px(2)),
         )
         style.configure(
             "Course.Treeview.Heading",
-            background=COLORS["surface_hover"],
+            background=COLORS["surface"],
+            lightcolor=COLORS["surface"],
+            darkcolor=COLORS["surface"],
+            bordercolor=COLORS["border"],
             foreground=COLORS["muted"],
             font=(FONT, 9, "bold"),
-            borderwidth=0,
+            padding=(px(8), px(6)),
             relief="flat",
         )
         style.map(
+            "Course.Treeview.Heading",
+            **flat([("active", COLORS["surface_hover"])]),
+        )
+        style.map(
             "Course.Treeview",
-            background=[("selected", COLORS["primary_soft"])],
+            background=[("selected", COLORS["surface_hover"])],
             foreground=[("selected", COLORS["ink"])],
+        )
+        # Slim, arrow-less scrollbars that match the flat surfaces.
+        style.layout(
+            "Vertical.TScrollbar",
+            [
+                (
+                    "Vertical.Scrollbar.trough",
+                    {
+                        "sticky": "ns",
+                        "children": [("Vertical.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"})],
+                    },
+                )
+            ],
+        )
+        style.configure(
+            "Vertical.TScrollbar",
+            background="#c3cec7",
+            lightcolor="#c3cec7",
+            darkcolor="#c3cec7",
+            troughcolor=COLORS["bg"],
+            bordercolor=COLORS["bg"],
+            gripcount=0,
+            arrowsize=px(11),
+        )
+        style.map(
+            "Vertical.TScrollbar",
+            **flat([("pressed", "#8d9891"), ("active", "#a8b3ac")]),
         )
         style.configure(
             "Horizontal.TProgressbar",
             background=COLORS["primary"],
+            lightcolor=COLORS["primary"],
+            darkcolor=COLORS["primary"],
             troughcolor=COLORS["surface_hover"],
+            bordercolor=COLORS["surface_hover"],
             borderwidth=0,
-            thickness=7,
+            thickness=px(6),
         )
         for name, background, foreground in (
             ("Ready", COLORS["surface"], COLORS["muted"]),
@@ -293,26 +444,116 @@ class BlackboardApp(tk.Tk):
                 f"{name}.Status.TLabel",
                 background=background,
                 foreground=foreground,
-                padding=(10, 5),
+                padding=(px(10), px(5)),
                 font=(FONT, 9, "bold"),
             )
         style.configure("TSeparator", background=COLORS["border"])
 
+    def _create_check_images(self) -> None:
+        """Draw DPI-scaled checkbox images shared by checkbuttons and the course tree."""
+        size = self._px(16)
+        gap = self._px(8)
+        specs = {
+            "off": (COLORS["bg"], "#97a59c", None),
+            "off_hover": (COLORS["bg"], COLORS["primary"], None),
+            "off_disabled": (COLORS["surface"], COLORS["border"], None),
+            "on": (COLORS["primary"], COLORS["primary"], "check"),
+            "on_disabled": ("#a8b3ac", "#a8b3ac", "check"),
+            "mixed": (COLORS["primary"], COLORS["primary"], "dash"),
+        }
+        self.check_images = {
+            name: self._draw_check(size, gap, *spec) for name, spec in specs.items()
+        }
+        self.tree_check_images = {
+            0: self.check_images["off"],
+            1: self.check_images["on"],
+            2: self.check_images["mixed"],
+        }
+
+    def _draw_check(
+        self, size: int, gap: int, fill: str, border: str, mark: str | None
+    ):
+        try:
+            from PIL import Image, ImageDraw, ImageTk
+        except ImportError:
+            image = tk.PhotoImage(master=self, width=size + gap, height=size)
+            image.put(border, to=(0, 0, size, size))
+            image.put(fill, to=(1, 1, size - 1, size - 1))
+            if mark:
+                inset = size // 4
+                top, bottom = (
+                    (size // 2 - 1, size // 2 + 1) if mark == "dash" else (inset, size - inset)
+                )
+                image.put("white", to=(inset, top, size - inset, bottom))
+            return image
+
+        factor = 4  # draw large, then downsample for smooth edges
+        box = size * factor
+        canvas = Image.new("RGBA", ((size + gap) * factor, box), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(canvas)
+        draw.rounded_rectangle(
+            (0, 0, box - 1, box - 1),
+            radius=box // 5,
+            fill=fill,
+            outline=border,
+            width=max(factor, round(1.5 * self.ui_scale * factor)),
+        )
+        stroke = max(factor, round(box * 0.13))
+        if mark == "check":
+            draw.line(
+                [(box * 0.24, box * 0.53), (box * 0.43, box * 0.71), (box * 0.77, box * 0.31)],
+                fill="white",
+                width=stroke,
+                joint="curve",
+            )
+        elif mark == "dash":
+            draw.line([(box * 0.27, box * 0.5), (box * 0.73, box * 0.5)], fill="white", width=stroke)
+        canvas = canvas.resize((size + gap, size), Image.Resampling.LANCZOS)
+        return ImageTk.PhotoImage(canvas, master=self)
+
     def _build_ui(self) -> None:
-        outer = ttk.Frame(self, padding=(32, 22, 32, 18))
-        outer.pack(fill="both", expand=True)
+        px = self._px
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        # The page scrolls as a whole when the window is shorter than its
+        # content (e.g. 1080p at 150%), so the course list is never squeezed
+        # away and nothing is cut off below the window edge.
+        self.page = tk.Canvas(
+            self,
+            background=COLORS["bg"],
+            borderwidth=0,
+            highlightthickness=0,
+            yscrollincrement=px(24),
+        )
+        self.page_scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.page.yview)
+        self.page.configure(yscrollcommand=self.page_scrollbar.set)
+        self.page.grid(row=0, column=0, sticky="nsew")
+        self.page_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.page_scrollbar.grid_remove()
+        self.page_scrolls = False
+        self.page_compact = False
+        self.page_layout_job: str | None = None
+        self.step_descriptions: list[ttk.Label] = []
+
+        outer = ttk.Frame(self.page, padding=(px(28), px(18), px(28), px(16)))
+        self.page_body = outer
+        self.page_window = self.page.create_window(0, 0, window=outer, anchor="nw")
+        self.page.bind("<Configure>", lambda _event: self._schedule_page_layout())
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.bind_all(sequence, self._scroll_page, add="+")
         outer.columnconfigure(0, weight=1)
         outer.rowconfigure(3, weight=1)
 
         header = ttk.Frame(outer)
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 18))
+        header.grid(row=0, column=0, sticky="ew", pady=(0, px(16)))
         header.columnconfigure(1, weight=1)
+        logo_size = px(40)
         try:
             from PIL import Image, ImageTk
 
             with Image.open(resource_path("assets", "app_icon.png")) as source:
                 header_logo = source.convert("RGBA")
-                header_logo.thumbnail((44, 44), Image.Resampling.LANCZOS)
+                header_logo.thumbnail((logo_size, logo_size), Image.Resampling.LANCZOS)
             self.header_logo_image = ImageTk.PhotoImage(header_logo)
         except (ImportError, OSError, tk.TclError):
             self.header_logo_image = None
@@ -322,8 +563,8 @@ class BlackboardApp(tk.Tk):
                 header,
                 image=self.header_logo_image,
                 background=COLORS["bg"],
-                width=44,
-                height=44,
+                width=logo_size,
+                height=logo_size,
                 borderwidth=0,
                 highlightthickness=0,
             )
@@ -337,31 +578,26 @@ class BlackboardApp(tk.Tk):
                 width=2,
                 height=1,
             )
-        self.logo_label.grid(row=0, column=0, rowspan=2, sticky="w", padx=(0, 12))
-        ttk.Label(header, text="Blackboard Downloader", style="Title.TLabel").grid(row=0, column=1, sticky="w")
-        self.forget_button = ttk.Button(
-            header,
-            text="Forget sign-in",
-            style="Quiet.TButton",
-            command=self._forget_sign_in,
-            state="disabled",
+        self.logo_label.grid(row=0, column=0, rowspan=2, sticky="w", padx=(0, px(12)))
+        ttk.Label(header, text="Blackboard Downloader", style="Title.TLabel").grid(
+            row=0, column=1, sticky="sw"
         )
-        self.forget_button.grid(row=0, column=2, sticky="e", padx=(0, 8))
-        self.forget_button.grid_remove()
+        subtitle = ttk.Label(
+            header,
+            text="A tidy offline copy of your course files, in three steps.",
+            style="Muted.TLabel",
+        )
+        subtitle.grid(row=1, column=1, sticky="nw", pady=(px(1), 0))
+        self.step_descriptions.append(subtitle)
         self.status_label = ttk.Label(
             header,
             textvariable=self.status_var,
             style="Ready.Status.TLabel",
         )
-        self.status_label.grid(row=0, column=3, sticky="e")
-        ttk.Label(
-            header,
-            text="A tidy offline copy of your course files, in three steps.",
-            style="Muted.TLabel",
-        ).grid(row=1, column=1, columnspan=3, sticky="w", pady=(3, 0))
+        self.status_label.grid(row=0, column=2, rowspan=2, sticky="e", padx=(px(12), 0))
 
-        self.connect_panel = ttk.Frame(outer, style="Surface.TFrame", padding=16)
-        self.connect_panel.grid(row=1, column=0, sticky="ew", pady=(0, 14))
+        self.connect_panel = ttk.Frame(outer, style="Surface.TFrame", padding=(px(18), px(14)))
+        self.connect_panel.grid(row=1, column=0, sticky="ew", pady=(0, px(18)))
         self.connect_panel.columnconfigure(0, weight=1)
         self._step_header(
             self.connect_panel,
@@ -369,27 +605,7 @@ class BlackboardApp(tk.Tk):
             "Connect",
             "Your password stays with your school; this session is saved securely on this device.",
             surface=True,
-        ).grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 10))
-        ttk.Label(
-            self.connect_panel,
-            text="BLACKBOARD ADDRESS",
-            style="SurfaceMuted.TLabel",
-            font=(FONT, 8, "bold"),
-        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 5))
-        self.url_entry = ttk.Entry(self.connect_panel, textvariable=self.url_var)
-        self.url_entry.grid(row=2, column=0, sticky="ew", padx=(0, 8))
-        self.url_entry.bind("<Return>", lambda _event: self._open_login())
-        self.open_login_button = ttk.Button(
-            self.connect_panel,
-            text="Open sign-in",
-            style="Primary.TButton",
-            command=self._open_login,
-        )
-        self.open_login_button.grid(row=2, column=1, padx=(0, 8))
-        self.signed_in_button = ttk.Button(
-            self.connect_panel, text="I’m signed in", command=self._capture_login, state="disabled"
-        )
-        self.signed_in_button.grid(row=2, column=2)
+        ).grid(row=0, column=0, sticky="ew")
         self.remember_check = ttk.Checkbutton(
             self.connect_panel,
             text="Remember sign-in on this device",
@@ -397,18 +613,17 @@ class BlackboardApp(tk.Tk):
             command=self._remember_preference_changed,
             style="Surface.TCheckbutton",
         )
-        self.remember_check.grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self.remember_check.grid(row=0, column=1, sticky="ne", padx=(px(12), 0))
 
+        # Once connected, the school and account replace the address form;
+        # "Change address" brings the form back without signing out.
         self.school_identity_shell = ttk.Frame(
             self.connect_panel, style="Surface.TFrame"
         )
         self.school_identity_shell.grid(
-            row=4, column=0, columnspan=3, sticky="ew", pady=(11, 0)
+            row=1, column=0, columnspan=2, sticky="ew", pady=(px(12), 0)
         )
         self.school_identity_shell.columnconfigure(1, weight=1)
-        ttk.Separator(self.school_identity_shell).grid(
-            row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10)
-        )
         self.school_logo_label = tk.Label(
             self.school_identity_shell,
             text="S",
@@ -419,30 +634,77 @@ class BlackboardApp(tk.Tk):
             height=2,
         )
         self.school_logo_label.grid(
-            row=1, column=0, rowspan=2, sticky="w", padx=(0, 11)
+            row=0, column=0, rowspan=2, sticky="w", padx=(0, px(12))
         )
         ttk.Label(
             self.school_identity_shell,
             textvariable=self.school_name_var,
             style="SurfaceIdentity.TLabel",
-        ).grid(row=1, column=1, sticky="w")
+        ).grid(row=0, column=1, sticky="sw")
         ttk.Label(
             self.school_identity_shell,
             textvariable=self.user_name_var,
             style="SurfaceMuted.TLabel",
-        ).grid(row=2, column=1, sticky="w", pady=(2, 0))
+        ).grid(row=1, column=1, sticky="nw", pady=(px(1), 0))
+        self.change_address_button = ttk.Button(
+            self.school_identity_shell,
+            text="Change address",
+            style="SurfaceQuiet.TButton",
+            command=lambda: self._show_address(not self.address_visible),
+        )
+        self.change_address_button.grid(row=0, column=2, rowspan=2, padx=(px(8), 0))
+        self.forget_button = ttk.Button(
+            self.school_identity_shell,
+            text="Forget sign-in",
+            style="SurfaceQuiet.TButton",
+            command=self._forget_sign_in,
+            state="disabled",
+        )
+        self.forget_button.grid(row=0, column=3, rowspan=2, padx=(px(2), 0))
         self.school_identity_shell.grid_remove()
+
+        self.address_row = ttk.Frame(self.connect_panel, style="Surface.TFrame")
+        self.address_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(px(12), 0))
+        self.address_row.columnconfigure(0, weight=1)
+        self.address_visible = True
+        ttk.Label(
+            self.address_row,
+            text="BLACKBOARD ADDRESS",
+            style="SurfaceField.TLabel",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, px(5)))
+        self.url_entry = ttk.Entry(self.address_row, textvariable=self.url_var, font=(FONT, 10))
+        self.url_entry.grid(row=1, column=0, sticky="nsew", padx=(0, px(8)))
+        self.url_entry.bind("<Return>", lambda _event: self._open_login())
+        self.open_login_button = ttk.Button(
+            self.address_row,
+            text="Open sign-in",
+            style="Primary.TButton",
+            command=self._open_login,
+        )
+        self.open_login_button.grid(row=1, column=1, sticky="ns", padx=(0, px(8)))
+        self.signed_in_button = ttk.Button(
+            self.address_row, text="I’m signed in", command=self._capture_login, state="disabled"
+        )
+        self.signed_in_button.grid(row=1, column=2, sticky="ns")
 
         controls = self._step_header(
             outer,
             2,
-            "Choose courses",
-            "Expand a course to choose exactly which content to save.",
+            "Choose course materials",
+            "Tick a whole course, or open it to pick folders and files.",
         )
-        controls.grid(row=2, column=0, sticky="ew", pady=(0, 9))
-        controls.columnconfigure(2, weight=1)
-        self.selection_label = ttk.Label(controls, text="Connect to load courses", style="Muted.TLabel")
-        self.selection_label.grid(row=0, column=3, rowspan=2, padx=(12, 8))
+        controls.grid(row=2, column=0, sticky="ew", pady=(0, px(10)))
+        self.filter_var = tk.StringVar()
+        self.filter_entry = ttk.Entry(
+            controls, textvariable=self.filter_var, width=20, font=(FONT, 10)
+        )
+        self.filter_entry.grid(row=0, column=2, rowspan=2, sticky="e", padx=(px(12), 0))
+        self.filter_placeholder = ttk.Label(
+            controls, text="Filter courses", style="Placeholder.TLabel"
+        )
+        self.filter_placeholder.bind("<Button-1>", lambda _event: self.filter_entry.focus_set())
+        self.filter_entry.bind("<Escape>", self._clear_course_filter)
+        self.filter_var.trace_add("write", lambda *_args: self._apply_course_filter())
         self.select_all_button = ttk.Button(
             controls,
             text="Select all",
@@ -450,10 +712,10 @@ class BlackboardApp(tk.Tk):
             command=self._select_all,
             state="disabled",
         )
-        self.select_all_button.grid(row=0, column=4, rowspan=2, padx=(6, 0))
+        self.select_all_button.grid(row=0, column=3, rowspan=2, sticky="e", padx=(px(6), 0))
 
-        course_shell = ttk.Frame(outer, style="Surface.TFrame")
-        course_shell.grid(row=3, column=0, sticky="nsew", pady=(0, 10))
+        course_shell = ttk.Frame(outer)
+        course_shell.grid(row=3, column=0, sticky="nsew", pady=(0, px(18)))
         course_shell.columnconfigure(0, weight=1)
         course_shell.rowconfigure(0, weight=1)
         self.course_tree = ttk.Treeview(
@@ -462,54 +724,77 @@ class BlackboardApp(tk.Tk):
             show="tree headings",
             selectmode="browse",
             style="Course.Treeview",
-            height=9,
+            height=5,
         )
         self.course_tree.heading("#0", text="Course / content", anchor="w")
-        self.course_tree.heading("details", text="Files", anchor="e")
-        self.course_tree.column("#0", minwidth=360, width=610, stretch=True)
-        self.course_tree.column("details", minwidth=120, width=210, stretch=False, anchor="e")
+        self.course_tree.heading("details", text="Contents", anchor="e")
+        self.course_tree.column("#0", minwidth=px(320), width=px(600), stretch=True)
+        self.course_tree.column(
+            "details", minwidth=px(120), width=px(220), stretch=False, anchor="e"
+        )
         self.course_tree.tag_configure(
             "term", foreground=COLORS["primary"], font=(FONT, 10, "bold")
         )
         self.course_tree.tag_configure("muted", foreground=COLORS["muted"])
-        scrollbar = ttk.Scrollbar(course_shell, orient="vertical", command=self.course_tree.yview)
-        self.course_tree.configure(yscrollcommand=scrollbar.set)
+        self.course_tree.tag_configure("hover", background=COLORS["surface"])
+        self.course_scrollbar = ttk.Scrollbar(
+            course_shell, orient="vertical", command=self.course_tree.yview
+        )
+        self.course_tree.configure(yscrollcommand=self.course_scrollbar.set)
         self.course_tree.grid(row=0, column=0, sticky="nsew")
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        self.course_tree.bind("<ButtonRelease-1>", self._tree_clicked)
+        self.course_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.course_tree.bind("<Button-1>", self._tree_pressed)
+        self.course_tree.bind("<Double-Button-1>", self._tree_pressed)
         self.course_tree.bind("<space>", self._tree_space_pressed)
+        self.course_tree.bind("<Return>", self._tree_return_pressed)
         self.course_tree.bind("<<TreeviewOpen>>", self._tree_opened)
+        self.course_tree.bind("<Motion>", self._tree_hovered)
+        self.course_tree.bind("<Leave>", lambda _event: self._set_tree_hover(None))
+        self.hover_item: str | None = None
+        self.term_items: dict[str, str] = {}
         self.course_tree.insert(
             "", "end", iid="message", text="Your courses will appear here after you connect."
         )
+        self._update_filter_placeholder()
 
         download = ttk.Frame(outer)
         download.grid(row=4, column=0, sticky="ew")
         download.columnconfigure(0, weight=1)
-        self._step_header(
+        download_header = self._step_header(
             download,
             3,
             "Download",
             "Choose files, Markdown notes, and URL shortcuts from the selected content.",
-        ).grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 10))
+        )
+        download_header.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, px(10)))
+        self.selection_label = ttk.Label(
+            download_header, text="Connect to load courses", style="Muted.TLabel"
+        )
+        self.selection_label.grid(row=0, column=2, rowspan=2, sticky="e", padx=(px(12), 0))
 
         fields = ttk.Frame(download)
         fields.grid(row=1, column=0, columnspan=3, sticky="ew")
         fields.columnconfigure(0, weight=1)
         save_field = ttk.Frame(fields)
-        save_field.grid(row=0, column=0, sticky="ew", padx=(0, 24))
+        save_field.grid(row=0, column=0, sticky="new", padx=(0, px(24)))
         save_field.columnconfigure(0, weight=1)
-        ttk.Label(save_field, text="SAVE TO", style="Field.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 5))
-        self.destination_entry = ttk.Entry(save_field, textvariable=self.destination_var)
-        self.destination_entry.grid(row=1, column=0, sticky="ew", padx=(0, 8))
+        ttk.Label(save_field, text="SAVE TO", style="Field.TLabel").grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, px(5))
+        )
+        self.destination_entry = ttk.Entry(
+            save_field, textvariable=self.destination_var, font=(FONT, 10)
+        )
+        self.destination_entry.grid(row=1, column=0, sticky="nsew", padx=(0, px(8)))
         self.browse_button = ttk.Button(save_field, text="Browse…", command=self._choose_destination)
-        self.browse_button.grid(row=1, column=1)
+        self.browse_button.grid(row=1, column=1, sticky="ns")
 
         types_field = ttk.Frame(fields)
         types_field.grid(row=0, column=1, sticky="nw")
-        ttk.Label(types_field, text="FILE TYPES", style="Field.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        ttk.Label(types_field, text="FILE TYPES", style="Field.TLabel").grid(
+            row=0, column=0, sticky="w", pady=(0, px(3))
+        )
         self.extension_container = ttk.Frame(types_field)
-        self.extension_container.grid(row=1, column=0, columnspan=3, sticky="w")
+        self.extension_container.grid(row=1, column=0, sticky="w")
         self.file_types_empty = ttk.Label(
             self.extension_container,
             text="Select course content to discover types",
@@ -518,21 +803,24 @@ class BlackboardApp(tk.Tk):
         self.file_types_empty.grid(row=0, column=0, sticky="w")
 
         self.progress = ttk.Progressbar(download, variable=self.progress_var, maximum=100)
-        self.progress.grid(row=2, column=0, sticky="ew", padx=(0, 10), pady=(12, 0))
+        self.progress.grid(row=2, column=0, sticky="ew", padx=(0, px(12)), pady=(px(14), 0))
         self.start_button = ttk.Button(download, text="Download selected", style="Primary.TButton", command=self._start_download, state="disabled")
-        self.start_button.grid(row=2, column=1, padx=(0, 8), pady=(12, 0))
+        self.start_button.grid(row=2, column=1, padx=(0, px(8)), pady=(px(14), 0))
         self.cancel_button = ttk.Button(download, text="Cancel", command=self._cancel_download, state="disabled")
-        self.cancel_button.grid(row=2, column=2, pady=(12, 0))
+        self.cancel_button.grid(row=2, column=2, pady=(px(14), 0))
 
-        activity = ttk.Frame(download, style="Surface.TFrame", padding=(12, 8))
-        activity.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        activity = ttk.Frame(download, style="Surface.TFrame", padding=(px(12), px(8)))
+        activity.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(px(12), 0))
         activity.columnconfigure(0, weight=1)
+        ttk.Label(activity, text="ACTIVITY", style="SurfaceField.TLabel").grid(
+            row=0, column=0, sticky="w", pady=(0, px(4))
+        )
         ttk.Label(
             activity,
-            text="ACTIVITY",
+            textvariable=self.update_status,
             style="SurfaceMuted.TLabel",
-            font=(FONT, 8, "bold"),
-        ).grid(row=0, column=0, sticky="w", pady=(0, 4))
+            font=(FONT, 8),
+        ).grid(row=0, column=1, sticky="e", pady=(0, px(4)))
         self.log = tk.Text(
             activity,
             height=2,
@@ -547,11 +835,8 @@ class BlackboardApp(tk.Tk):
             highlightthickness=0,
             state="disabled",
         )
-        self.log.grid(row=1, column=0, sticky="ew")
+        self.log.grid(row=1, column=0, columnspan=2, sticky="ew")
         self._set_log_placeholder("Waiting to connect.")
-        ttk.Label(
-            download, textvariable=self.update_status, style="Muted.TLabel",
-        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
     def _step_header(
         self,
@@ -565,18 +850,121 @@ class BlackboardApp(tk.Tk):
         label_style = "SurfaceSection.TLabel" if surface else "Section.TLabel"
         muted_style = "SurfaceMuted.TLabel" if surface else "Muted.TLabel"
         frame = ttk.Frame(parent, style=style)
+        frame.columnconfigure(1, weight=1)
         tk.Label(
             frame,
             text=str(number),
             font=(FONT, 9, "bold"),
-            background=COLORS["primary_soft"],
-            foreground=COLORS["primary"],
+            background=COLORS["primary"],
+            foreground="white",
             width=2,
             height=1,
-        ).grid(row=0, column=0, rowspan=2, sticky="w", padx=(0, 10))
+        ).grid(row=0, column=0, rowspan=2, sticky="w", padx=(0, self._px(10)))
         ttk.Label(frame, text=title, style=label_style).grid(row=0, column=1, sticky="w")
-        ttk.Label(frame, text=description, style=muted_style).grid(row=1, column=1, sticky="w", pady=(1, 0))
+        description_label = ttk.Label(frame, text=description, style=muted_style)
+        description_label.grid(row=1, column=1, sticky="w", pady=(self._px(1), 0))
+        self.step_descriptions.append(description_label)
         return frame
+
+    def _work_area(self) -> tuple[int, int, int, int]:
+        """Return the usable desktop area, excluding the Windows taskbar."""
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                rect = wintypes.RECT()
+                if ctypes.windll.user32.SystemParametersInfoW(  # type: ignore[attr-defined]
+                    0x0030, 0, ctypes.byref(rect), 0  # SPI_GETWORKAREA
+                ):
+                    return rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top
+            except (AttributeError, OSError):
+                pass
+        return 0, 0, self.winfo_screenwidth(), self.winfo_screenheight()
+
+    def _fit_to_screen(self) -> None:
+        """Open at a comfortable size that never runs past the visible desktop."""
+        left, top, area_width, area_height = self._work_area()
+        frame = self._px(72)  # title bar, menu bar, and window borders
+        width = max(1, min(self._px(960), area_width - self._px(16)))
+        height = max(1, min(self._px(820), area_height - frame))
+        self.minsize(min(self._px(720), width), min(self._px(420), height))
+        x = left + max(0, (area_width - width) // 2)
+        y = top + max(0, (area_height - frame - height) // 2)
+        self.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _schedule_page_layout(self) -> None:
+        if self.page_layout_job is None:
+            # Run after Tk's idle geometry pass so requested sizes are current.
+            self.page_layout_job = self.after(15, self._layout_page)
+
+    def _layout_page(self) -> None:
+        """Stretch the page to the window, or let it scroll when it cannot fit."""
+        self.page_layout_job = None
+        view_height = self.page.winfo_height()
+        needed = self.page_body.winfo_reqheight()
+        # Short windows drop the explanatory sentences before resorting to
+        # scrolling; the estimate of their height errs on the generous side.
+        hidden = (
+            sum(label.winfo_reqheight() + self._px(1) for label in self.step_descriptions)
+            if self.page_compact
+            else 0
+        )
+        compact = needed + hidden > view_height
+        if compact != self.page_compact:
+            self.page_compact = compact
+            for label in self.step_descriptions:
+                if compact:
+                    label.grid_remove()
+                else:
+                    label.grid()
+            self._schedule_page_layout()
+            return
+        scrolls = needed > view_height
+        if scrolls != self.page_scrolls:
+            self.page_scrolls = scrolls
+            if scrolls:
+                self.page_scrollbar.grid()
+            else:
+                self.page_scrollbar.grid_remove()
+                self.page.yview_moveto(0)
+        width = self.page.winfo_width()
+        height = max(view_height, needed)
+        self.page.itemconfigure(self.page_window, width=width, height=height)
+        self.page.configure(scrollregion=(0, 0, width, height))
+
+    def _scroll_page(self, event) -> None:
+        if not self.page_scrolls:
+            return
+        target = str(event.widget)
+        if not (target.startswith(str(self.page)) or target == str(self.page_scrollbar)):
+            return  # dialogs and menus
+        # The course list and activity log scroll themselves while they can.
+        for owners, scrollable in (
+            ((self.course_tree, self.course_scrollbar), self.course_tree),
+            ((self.log,), self.log),
+        ):
+            if target in map(str, owners) and tuple(scrollable.yview()) != (0.0, 1.0):
+                return
+        if event.num in (4, 5):
+            steps = -1 if event.num == 4 else 1
+        elif event.delta:
+            delta = event.delta if sys.platform == "darwin" else event.delta / 120
+            steps = -round(delta) or (-1 if event.delta > 0 else 1)
+        else:
+            return
+        self.page.yview_scroll(steps, "units")
+
+    def _show_address(self, visible: bool) -> None:
+        self.address_visible = visible
+        if visible:
+            self.address_row.grid()
+        else:
+            self.address_row.grid_remove()
+        self.change_address_button.configure(
+            text="Hide address" if visible else "Change address"
+        )
+        self._schedule_page_layout()
 
     def _open_login(self) -> None:
         try:
@@ -748,23 +1136,37 @@ class BlackboardApp(tk.Tk):
         except Exception as exc:
             self.events.put(("error", exc))
 
-    def _render_courses(self) -> None:
+    def _clear_tree(self) -> None:
         self.course_tree.delete(*self.course_tree.get_children())
+        # Filtered-out rows are detached rather than children of the root.
+        for item in (*self.term_items.values(), *self.course_tree_items.values()):
+            if self.course_tree.exists(item):
+                self.course_tree.delete(item)
         self.tree_meta.clear()
         self.tree_states.clear()
         self.tree_labels.clear()
+        self.file_selection.clear()
+        self.term_items.clear()
         self.course_tree_items.clear()
         self.content_tree_items.clear()
+        self.hover_item = None
+
+    def _render_courses(self) -> None:
+        self._clear_tree()
         self.course_load_states.clear()
         self.pending_course_selection.clear()
-        term_items: dict[str, str] = {}
+        term_counts: dict[str, int] = {}
         for course in self.courses:
-            term_item = term_items.get(course.term)
+            term_item = self.term_items.get(course.term)
             if term_item is None:
                 term_item = self.course_tree.insert(
                     "", "end", text=course.term, open=True, tags=("term",)
                 )
-                term_items[course.term] = term_item
+                self.term_items[course.term] = term_item
+                self.tree_meta[term_item] = ("term", course.term, None)
+                self.tree_labels[term_item] = course.term
+                self.tree_states[term_item] = 0
+            term_counts[course.term] = term_counts.get(course.term, 0) + 1
             course_item = self.course_tree.insert(
                 term_item,
                 "end",
@@ -779,19 +1181,25 @@ class BlackboardApp(tk.Tk):
             self.course_tree.insert(
                 course_item,
                 "end",
-                text="Expand this course to load its content",
-                values=("Not loaded",),
+                text="Open this course to load its materials",
+                values=("",),
                 tags=("muted",),
             )
             self.course_load_states[course.id] = "unloaded"
             self.pending_course_selection[course.id] = None
             self.tree_states[course_item] = 0
             self._refresh_tree_label(course_item)
+        for term, term_item in self.term_items.items():
+            count = term_counts[term]
+            self.course_tree.item(
+                term_item, values=(f"{count} course{'s' if count != 1 else ''}",)
+            )
+            self._refresh_tree_label(term_item)
         if not self.courses:
             self.course_tree.insert(
                 "", "end", iid="message", text="No accessible courses were found for this account."
             )
-        self._update_selection()
+        self._apply_course_filter()
 
     def _insert_content_node(
         self,
@@ -814,6 +1222,8 @@ class BlackboardApp(tk.Tk):
         )
         self.tree_meta[item] = ("content", course_id, node.id)
         self.tree_states[item] = 1 if selected else 0
+        if node.files:
+            self.file_selection[item] = selected
         self.tree_labels[item] = node.title
         self.content_tree_items[(course_id, node.id)] = item
         self._refresh_tree_label(item)
@@ -839,26 +1249,94 @@ class BlackboardApp(tk.Tk):
         return extension.lstrip(".").upper() if extension else "NO EXT"
 
     def _show_course_message(self, message: str) -> None:
-        self.course_tree.delete(*self.course_tree.get_children())
+        self._clear_tree()
         self.course_tree.insert("", "end", iid="message", text=message)
 
+    def _update_filter_placeholder(self) -> None:
+        if self.filter_var.get():
+            self.filter_placeholder.place_forget()
+        else:
+            self.filter_placeholder.place(
+                in_=self.filter_entry, x=self._px(10), rely=0.5, anchor="w"
+            )
+
+    def _clear_course_filter(self, _event=None) -> str:
+        self.filter_var.set("")
+        return "break"
+
+    def _apply_course_filter(self) -> None:
+        """Show only courses whose name or code contains the filter text."""
+        self._update_filter_placeholder()
+        if self.course_tree.exists("filter-empty"):
+            self.course_tree.delete("filter-empty")
+        query = self.filter_var.get().strip().casefold()
+        visible_terms = 0
+        for term, term_item in self.term_items.items():
+            index = 0
+            for course in self.courses:
+                if course.term != term:
+                    continue
+                item = self.course_tree_items[course.id]
+                if (
+                    not query
+                    or query in course.name.casefold()
+                    or query in course.code.casefold()
+                ):
+                    self.course_tree.move(item, term_item, index)
+                    index += 1
+                else:
+                    self.course_tree.detach(item)
+            if index:
+                self.course_tree.move(term_item, "", visible_terms)
+                visible_terms += 1
+                self._refresh_from_children(term_item)
+            else:
+                self.course_tree.detach(term_item)
+        if self.term_items and not visible_terms:
+            self.course_tree.insert(
+                "",
+                "end",
+                iid="filter-empty",
+                text=f"No courses match “{self.filter_var.get().strip()}”",
+                tags=("muted",),
+            )
+        self._update_selection()
+
+    def _visible_course_ids(self) -> list[str]:
+        return [
+            course.id
+            for course in self.courses
+            if course.id in self.course_tree_items
+            and self.course_tree.parent(self.course_tree_items[course.id])
+        ]
+
     def _select_all(self) -> None:
-        should_select = not self.courses or not all(
-            self._course_is_effectively_selected(course.id) for course in self.courses
+        visible = self._visible_course_ids()
+        should_select = not all(
+            self._course_is_effectively_selected(course_id) for course_id in visible
         )
-        target = 1 if should_select else 0
-        for course in self.courses:
-            item = self.course_tree_items.get(course.id)
+        self._set_courses_selected(visible, should_select)
+
+    def _set_courses_selected(self, course_ids: list[str], select: bool) -> None:
+        target = 1 if select else 0
+        for course_id in course_ids:
+            item = self.course_tree_items.get(course_id)
             if not item:
                 continue
-            if self.course_load_states.get(course.id) == "loaded":
+            state = self.course_load_states.get(course_id)
+            if state == "loaded":
                 self._set_tree_branch(item, target)
-            elif should_select:
-                self._ensure_course_loaded(course.id, select_after=1)
+            elif state == "loading":
+                self.pending_course_selection[course_id] = target
+                self.tree_states[item] = target
+                self._refresh_tree_label(item)
+            elif select:
+                self._ensure_course_loaded(course_id, select_after=1)
             else:
-                self.pending_course_selection[course.id] = 0
+                self.pending_course_selection[course_id] = 0
                 self.tree_states[item] = 0
                 self._refresh_tree_label(item)
+            self._refresh_ancestors(item)
         self._update_selection()
 
     def _course_is_effectively_selected(self, course_id: str) -> bool:
@@ -872,35 +1350,72 @@ class BlackboardApp(tk.Tk):
         if metadata and metadata[0] == "course":
             self._ensure_course_loaded(metadata[1])
 
-    def _tree_clicked(self, event) -> None:
-        if self.busy or self.course_tree.identify_column(event.x) != "#0":
-            return
-        item = self.course_tree.identify_row(event.y)
-        element = self.course_tree.identify_element(event.x, event.y)
-        if not item or item not in self.tree_meta:
-            return
-        kind, course_id, _ = self.tree_meta[item]
+    def _tree_pressed(self, event) -> str | None:
+        tree = self.course_tree
+        item = tree.identify_row(event.y)
+        if (
+            not item
+            or item not in self.tree_meta
+            or tree.identify_region(event.x, event.y) not in ("tree", "cell")
+        ):
+            return None
+        element = tree.identify_element(event.x, event.y)
         if "indicator" in element:
-            if kind == "course":
-                self._ensure_course_loaded(course_id)
-            return
+            return None  # Tk's own binding expands or collapses the row
+        tree.focus_set()
+        tree.focus(item)
+        tree.selection_set(item)
+        if "image" in element:
+            if not self.busy:
+                self._toggle_tree_item(item)
+        elif not self._open_tree_item(item) and not self.busy:
+            self._toggle_tree_item(item)
+        return "break"
+
+    def _open_tree_item(self, item: str) -> bool:
+        """Expand or collapse a course or folder row; False for leaf rows."""
+        kind, course_id, _ = self.tree_meta[item]
         if kind == "course" and self.course_load_states.get(course_id) != "loaded":
-            self._ensure_course_loaded(course_id, select_after=1)
-            return
-        self._toggle_tree_item(item)
+            self._ensure_course_loaded(course_id)
+            return True
+        if not self.course_tree.get_children(item):
+            return False
+        self.course_tree.item(item, open=not self.course_tree.item(item, "open"))
+        return True
 
     def _tree_space_pressed(self, _event) -> str | None:
-        if self.busy:
+        item = self.course_tree.focus()
+        if self.busy or item not in self.tree_meta:
             return None
-        selected = self.course_tree.selection()
-        if selected and selected[0] in self.tree_meta:
-            kind, course_id, _ = self.tree_meta[selected[0]]
-            if kind == "course" and self.course_load_states.get(course_id) != "loaded":
-                self._ensure_course_loaded(course_id, select_after=1)
-                return "break"
-            self._toggle_tree_item(selected[0])
-            return "break"
-        return None
+        self._toggle_tree_item(item)
+        return "break"
+
+    def _tree_return_pressed(self, _event) -> str | None:
+        item = self.course_tree.focus()
+        if item not in self.tree_meta:
+            return None
+        if not self._open_tree_item(item) and not self.busy:
+            self._toggle_tree_item(item)
+        return "break"
+
+    def _tree_hovered(self, event) -> None:
+        item = self.course_tree.identify_row(event.y)
+        self._set_tree_hover(item if item in self.tree_meta else None)
+        on_checkbox = (
+            item in self.tree_meta
+            and "image" in self.course_tree.identify_element(event.x, event.y)
+        )
+        self.course_tree.configure(cursor="hand2" if on_checkbox and not self.busy else "")
+
+    def _set_tree_hover(self, item: str | None) -> None:
+        if item == self.hover_item:
+            return
+        tree = self.course_tree
+        if self.hover_item and tree.exists(self.hover_item):
+            tree.tk.call(tree, "tag", "remove", "hover", self.hover_item)
+        self.hover_item = item
+        if item:
+            tree.tk.call(tree, "tag", "add", "hover", item)
 
     def _ensure_course_loaded(
         self, course_id: str, select_after: int | None = None
@@ -908,35 +1423,43 @@ class BlackboardApp(tk.Tk):
         if self.installing_update:
             return
         state = self.course_load_states.get(course_id)
+        tree_item = self.course_tree_items.get(course_id)
         if state == "loaded":
-            if select_after is not None:
-                item = self.course_tree_items.get(course_id)
-                if item:
-                    self._set_tree_branch(item, select_after)
-                    self._update_selection()
+            if select_after is not None and tree_item:
+                self._set_tree_branch(tree_item, select_after)
+                self._refresh_ancestors(tree_item)
+                self._update_selection()
             return
         if state == "loading":
-            if select_after is not None:
+            if select_after is not None and tree_item:
                 self.pending_course_selection[course_id] = select_after
+                self.tree_states[tree_item] = select_after
+                self._refresh_tree_label(tree_item)
+                self._refresh_ancestors(tree_item)
             return
         course = next((item for item in self.courses if item.id == course_id), None)
-        tree_item = self.course_tree_items.get(course_id)
         if course is None or tree_item is None or self.client is None:
             return
 
         self.course_load_states[course_id] = "loading"
         self.pending_course_selection[course_id] = select_after
-        self.tree_states[tree_item] = 0
+        # Show a ticked course straight away; it stays ticked once loaded.
+        self.tree_states[tree_item] = 1 if select_after == 1 else 0
         self._refresh_tree_label(tree_item)
-        loading_detail = f"{course.code} · Loading…" if course.code else "Loading…"
-        self.course_tree.item(tree_item, open=True, values=(loading_detail,))
+        self._refresh_ancestors(tree_item)
+        # Ticking a closed course loads it in the background without
+        # expanding it, so bulk selection keeps the list compact.
+        if select_after is None:
+            self.course_tree.item(tree_item, open=True, values=("Loading…",))
+        else:
+            self.course_tree.item(tree_item, values=("Loading…",))
         for child in self.course_tree.get_children(tree_item):
             self.course_tree.delete(child)
         self.course_tree.insert(
             tree_item,
             "end",
-            text="Loading document files…",
-            values=("Please wait",),
+            text="Loading course materials…",
+            values=("",),
             tags=("muted",),
         )
         self._append_log(f"Loading content for {course.name}…")
@@ -947,6 +1470,7 @@ class BlackboardApp(tk.Tk):
             args=(course, self.client, cancel),
             daemon=True,
         ).start()
+        self._update_selection()
 
     def _load_course_content_worker(
         self,
@@ -989,13 +1513,12 @@ class BlackboardApp(tk.Tk):
         if error is not None:
             self.course_load_states[course_id] = "error"
             self.content_errors[course_id] = str(error)
-            error_detail = f"{course.code} · Unavailable" if course.code else "Unavailable"
-            self.course_tree.item(tree_item, values=(error_detail,))
+            self.course_tree.item(tree_item, values=("Unavailable",))
             self.course_tree.insert(
                 tree_item,
                 "end",
-                text="Content could not be loaded — click the course to retry",
-                values=("Unavailable",),
+                text="Content could not be loaded — open the course again to retry",
+                values=("",),
                 tags=("muted",),
             )
             self.tree_states[tree_item] = 0
@@ -1004,8 +1527,13 @@ class BlackboardApp(tk.Tk):
             self.course_load_states[course_id] = "loaded"
             self.content_errors.pop(course_id, None)
             self.course_contents[course_id] = contents
-            self.course_tree.item(tree_item, values=(course.code,))
             if contents:
+                total = sum(
+                    sum(self._node_extension_counts(node).values()) for node in contents
+                )
+                self.course_tree.item(
+                    tree_item, values=(f"{total} item{'s' if total != 1 else ''}",)
+                )
                 for node in contents:
                     self._insert_content_node(
                         tree_item, course_id, node, selected=selected
@@ -1013,17 +1541,18 @@ class BlackboardApp(tk.Tk):
                 self.tree_states[tree_item] = 1 if selected else 0
                 self._append_log(f"Loaded document files from {course.name}.")
             else:
+                self.course_tree.item(tree_item, values=("Empty",))
                 self.course_tree.insert(
                     tree_item,
                     "end",
                     text="No document files found",
-                    values=("Empty",),
+                    values=("",),
                     tags=("muted",),
                 )
                 self.tree_states[tree_item] = 0
                 self._append_log(f"No document files were found in {course.name}.")
         self._refresh_tree_label(tree_item)
-        self.course_tree.item(tree_item, open=True)
+        self._refresh_ancestors(tree_item)
         self._update_selection()
 
     def _forget_tree_branch(self, item: str) -> None:
@@ -1032,82 +1561,69 @@ class BlackboardApp(tk.Tk):
         metadata = self.tree_meta.pop(item, None)
         self.tree_states.pop(item, None)
         self.tree_labels.pop(item, None)
+        self.file_selection.pop(item, None)
         if metadata and metadata[0] == "content" and metadata[2] is not None:
             self.content_tree_items.pop((metadata[1], metadata[2]), None)
 
     def _toggle_tree_item(self, item: str) -> None:
-        target = 0 if self.tree_states.get(item) == 1 else 1
-        self._set_tree_branch(item, target)
+        kind, course_id, _ = self.tree_meta[item]
+        select = self.tree_states.get(item) != 1
+        if kind == "term":
+            course_ids = [
+                self.tree_meta[child][1]
+                for child in self.course_tree.get_children(item)
+                if child in self.tree_meta
+            ]
+            self._set_courses_selected(course_ids, select)
+        elif kind == "course" and self.course_load_states.get(course_id) != "loaded":
+            self._set_courses_selected([course_id], select)
+        else:
+            self._set_tree_branch(item, 1 if select else 0)
+            self._refresh_ancestors(item)
+            self._update_selection()
+
+    def _refresh_ancestors(self, item: str) -> None:
         parent = self.course_tree.parent(item)
         while parent and parent in self.tree_meta:
-            child_states = [
-                self.tree_states[child]
-                for child in self.course_tree.get_children(parent)
-                if child in self.tree_states
-            ]
-            if child_states and all(state == 1 for state in child_states):
-                state = 1
-            elif child_states and all(state == 0 for state in child_states):
-                state = 0
-            else:
-                state = 2
-            self.tree_states[parent] = state
-            self._refresh_tree_label(parent)
+            self._refresh_from_children(parent)
             parent = self.course_tree.parent(parent)
-        self._update_selection()
+
+    def _refresh_from_children(self, item: str) -> None:
+        states = {
+            self.tree_states[child]
+            for child in self.course_tree.get_children(item)
+            if child in self.tree_states
+        }
+        if item in self.file_selection:
+            states.add(1 if self.file_selection[item] else 0)
+        if len(states) == 1:
+            self.tree_states[item] = states.pop()
+        else:
+            self.tree_states[item] = 2 if states else 0
+        self._refresh_tree_label(item)
 
     def _set_tree_branch(self, item: str, state: int) -> None:
         if item in self.tree_states:
             self.tree_states[item] = state
+            if item in self.file_selection:
+                self.file_selection[item] = state == 1
             self._refresh_tree_label(item)
         for child in self.course_tree.get_children(item):
             self._set_tree_branch(child, state)
 
     def _refresh_tree_label(self, item: str) -> None:
-        symbols = {0: "☐", 1: "☑", 2: "◩"}
         self.course_tree.item(
             item,
-            text=f"{symbols[self.tree_states[item]]}  {self.tree_labels[item]}",
+            text=self.tree_labels[item],
+            image=self.tree_check_images[self.tree_states[item]],
         )
 
-    def _update_selection(self) -> None:
-        selected_courses = sum(
-            self._course_is_effectively_selected(course.id)
-            or self.tree_states.get(self.course_tree_items.get(course.id, ""), 0) == 2
-            for course in self.courses
-        )
-        selected_parts = sum(
-            self.tree_states.get(item, 0) == 1
-            for item in self.content_tree_items.values()
-        )
-        total = len(self.course_tree_items)
-        if total:
-            self.selection_label.configure(
-                text=f"{selected_courses} course{'s' if selected_courses != 1 else ''} · "
-                f"{selected_parts} part{'s' if selected_parts != 1 else ''}"
-            )
-        else:
-            self.selection_label.configure(text="No courses")
-        self.select_all_button.configure(state="normal" if total and not self.busy else "disabled")
-        all_selected = bool(total) and all(
-            self._course_is_effectively_selected(course.id) for course in self.courses
-        )
-        self.select_all_button.configure(text="Clear all" if all_selected else "Select all")
-        self._render_extension_filters()
-
-    def _render_extension_filters(self) -> None:
-        for extension, variable in self.extension_vars.items():
-            self.extension_preferences[extension] = variable.get()
-        for child in self.extension_container.winfo_children():
-            child.destroy()
-        self.extension_vars.clear()
-        self.extension_checks.clear()
-
+    def _selected_extension_counts(self) -> dict[str, int]:
         counts: dict[str, int] = {}
 
         def collect(course_id: str, node: ContentNode) -> None:
             item = self.content_tree_items.get((course_id, node.id))
-            if item and self.tree_states.get(item) == 1:
+            if item and self.file_selection.get(item):
                 for remote in node.files:
                     counts[remote.extension] = counts.get(remote.extension, 0) + 1
             for child in node.children:
@@ -1116,6 +1632,51 @@ class BlackboardApp(tk.Tk):
         for course in self.courses:
             for root in self.course_contents.get(course.id, ()):
                 collect(course.id, root)
+        return counts
+
+    def _update_selection(self) -> None:
+        selected_courses = sum(
+            self._course_is_effectively_selected(course.id)
+            or self.tree_states.get(self.course_tree_items.get(course.id, ""), 0) == 2
+            for course in self.courses
+        )
+        loading = sum(
+            self.course_load_states.get(course.id) == "loading"
+            and self.pending_course_selection.get(course.id) == 1
+            for course in self.courses
+        )
+        counts = self._selected_extension_counts()
+        items = sum(counts.values())
+        if not self.course_tree_items:
+            text = "No courses"
+        elif items or selected_courses:
+            text = (
+                f"{items} item{'s' if items != 1 else ''} selected from "
+                f"{selected_courses} course{'s' if selected_courses != 1 else ''}"
+            )
+        else:
+            text = "Nothing selected"
+        if loading:
+            text += f" · loading {loading}"
+        self.selection_label.configure(text=text)
+        visible = self._visible_course_ids()
+        self.select_all_button.configure(
+            state="normal" if visible and not self.busy else "disabled"
+        )
+        all_selected = bool(visible) and all(
+            self._course_is_effectively_selected(course_id) for course_id in visible
+        )
+        self.select_all_button.configure(text="Clear all" if all_selected else "Select all")
+        self._render_extension_filters(counts)
+        self._schedule_page_layout()
+
+    def _render_extension_filters(self, counts: dict[str, int]) -> None:
+        for extension, variable in self.extension_vars.items():
+            self.extension_preferences[extension] = variable.get()
+        for child in self.extension_container.winfo_children():
+            child.destroy()
+        self.extension_vars.clear()
+        self.extension_checks.clear()
 
         if not counts:
             self.file_types_empty = ttk.Label(
@@ -1142,7 +1703,7 @@ class BlackboardApp(tk.Tk):
                 variable=variable,
                 command=lambda ext=extension, var=variable: self._extension_changed(ext, var),
             )
-            check.grid(row=index // 3, column=index % 3, sticky="w", padx=(0, 12))
+            check.grid(row=index // 3, column=index % 3, sticky="w", padx=(0, self._px(14)))
             check.configure(state="disabled" if self.busy else "normal")
             self.extension_checks.append(check)
         self._update_download_button()
@@ -1152,10 +1713,7 @@ class BlackboardApp(tk.Tk):
         self._update_download_button()
 
     def _update_download_button(self) -> None:
-        has_content = any(
-            self.tree_states.get(item) == 1
-            for item in self.content_tree_items.values()
-        )
+        has_content = any(self.file_selection.values())
         has_types = any(variable.get() for variable in self.extension_vars.values())
         self.start_button.configure(
             state="normal" if has_content and has_types and not self.busy else "disabled"
@@ -1176,7 +1734,7 @@ class BlackboardApp(tk.Tk):
             selected_ids = {
                 node_id
                 for (course_id, node_id), item in self.content_tree_items.items()
-                if course_id == course.id and self.tree_states.get(item) == 1
+                if course_id == course.id and self.file_selection.get(item)
             }
             contents = filter_content_nodes(
                 self.course_contents.get(course.id, ()), selected_ids
@@ -1463,7 +2021,7 @@ class BlackboardApp(tk.Tk):
                     self._set_busy(False, f"Connected · {len(self.courses)} courses found")
                     self._set_status(f"Connected · {len(self.courses)} courses", "success")
                     self._apply_identity(profile, branding)
-                    self.forget_button.grid()
+                    self._show_address(False)
                     self.forget_button.configure(state="normal")
                     if restored:
                         connection_message = (
@@ -1609,7 +2167,7 @@ class BlackboardApp(tk.Tk):
                 image = Image.open(BytesIO(branding.logo_bytes)).convert("RGBA")
                 # Keep wide institution marks readable: constrain their height
                 # without forcing them into a square or enlarging small images.
-                image.thumbnail((image.width, 42), Image.Resampling.LANCZOS)
+                image.thumbnail((image.width, self._px(40)), Image.Resampling.LANCZOS)
                 self.school_logo_image = ImageTk.PhotoImage(image)
                 self.school_logo_label.configure(
                     image=self.school_logo_image,
@@ -1653,7 +2211,7 @@ class BlackboardApp(tk.Tk):
         )
         self.school_identity_shell.grid_remove()
         self.forget_button.configure(state="disabled")
-        self.forget_button.grid_remove()
+        self._show_address(True)
 
     def _forget_sign_in(self) -> None:
         if not self.profile or self.busy:
@@ -1767,25 +2325,23 @@ class BlackboardApp(tk.Tk):
         try:
             for extension, variable in self.extension_vars.items():
                 self.extension_preferences[extension] = variable.get()
+            settings = {
+                "url": self.url_var.get().strip(),
+                "destination": self.destination_var.get().strip(),
+                "remember_session": self.remember_var.get(),
+                "check_updates": self.check_updates_var.get(),
+                "auto_update": self.auto_update_var.get(),
+            }
+            # Only record a type choice once types have been offered; an empty
+            # list saved before then would untick every type on the next launch.
+            if self.extension_preferences:
+                settings["extensions"] = sorted(
+                    extension
+                    for extension, selected in self.extension_preferences.items()
+                    if selected
+                )
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(
-                json.dumps(
-                    {
-                        "url": self.url_var.get().strip(),
-                        "destination": self.destination_var.get().strip(),
-                        "remember_session": self.remember_var.get(),
-                        "check_updates": self.check_updates_var.get(),
-                        "auto_update": self.auto_update_var.get(),
-                        "extensions": sorted(
-                            extension
-                            for extension, selected in self.extension_preferences.items()
-                            if selected
-                        ),
-                    },
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
+            path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
         except OSError:
             pass
 
@@ -1808,4 +2364,5 @@ class BlackboardApp(tk.Tk):
 
 def main() -> None:
     configure_process_identity()
+    configure_dpi_awareness()
     BlackboardApp().mainloop()

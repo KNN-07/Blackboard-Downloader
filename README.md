@@ -21,7 +21,9 @@ It is designed for Blackboard Ultra installations that expose Blackboard's publi
 - Restores sign-in securely across launches using the operating system credential vault.
 - Shows the signed-in account and institution branding captured from Blackboard.
 - Loads course content lazily when a course is opened instead of scanning everything at startup.
-- Expands courses into a selectable content tree for partial-course downloads.
+- Expands courses into a selectable content tree with tri-state checkboxes: tick a whole term, course, folder, or single item.
+- Filters long course lists by name or code.
+- Scales cleanly on high-DPI displays and scrolls instead of clipping when the window is short.
 - Discovers file extensions dynamically from the selected content.
 - Distinguishes navigation links from explicitly attached files, including HTML, JavaScript, JSON, and other course/code files.
 - Indexes courses and content items concurrently with a shared request limit.
@@ -222,11 +224,11 @@ The **Build installers** workflow supports two release paths:
 - Push a version tag to build every platform and publish the results as a GitHub Release:
 
 ```bash
-git tag v0.2.1
-git push origin v0.2.1
+git tag v0.2.2
+git push origin v0.2.2
 ```
 
-Version tags must begin with `v` and use a value such as `v0.2.1` or `v0.2.1-beta.1`.
+Version tags must begin with `v` and use a value such as `v0.2.2` or `v0.2.2-beta.1`.
 
 The release matrix produces:
 
